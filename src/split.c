@@ -39,30 +39,35 @@
 enum
 {
   OPTION_FROM = 1000,
-  OPTION_CONSOLE_SOCKET,
-  OPTION_PID_FILE,
-  OPTION_NO_SUBREAPER,
-  OPTION_NO_NEW_KEYRING,
-  OPTION_PRESERVE_FDS,
-  OPTION_NO_PIVOT
+  OPTION_SHARE_NETWORK,
+  OPTION_SHARE_IPC,
+  OPTION_SHARE_UTS,
+  OPTION_SHARE_PID,
+  OPTION_SHARE_USER,
+  OPTION_SHARE_CGROUP,
 };
 
 static const char *bundle = NULL;
 static const char *from_id = NULL;
+static bool share_network = false;
+static bool share_ipc = false;
+static bool share_uts = false;
+static bool share_pid = false;
+static bool share_user = false;
+static bool share_cgroup = false;
 
 static libcrun_context_t crun_context;
 
 static struct argp_option options[]
     = { { "from", OPTION_FROM, "ID", 0, "parent container ID to split from (COW)", 0 },
+        { "share-network", OPTION_SHARE_NETWORK, 0, 0, "share parent's network namespace", 0 },
+        { "share-ipc", OPTION_SHARE_IPC, 0, 0, "share parent's IPC namespace", 0 },
+        { "share-uts", OPTION_SHARE_UTS, 0, 0, "share parent's UTS namespace", 0 },
+        { "share-pid", OPTION_SHARE_PID, 0, 0, "share parent's PID namespace", 0 },
+        { "share-user", OPTION_SHARE_USER, 0, 0, "share parent's user namespace", 0 },
+        { "share-cgroup", OPTION_SHARE_CGROUP, 0, 0, "share parent's cgroup namespace", 0 },
         { "bundle", 'b', "DIR", 0, "container bundle (default \".\")", 0 },
         { "config", 'f', "FILE", 0, "override the config file name", 0 },
-        { "console-socket", OPTION_CONSOLE_SOCKET, "SOCK", 0,
-          "path to a socket that will receive the ptmx end of the tty", 0 },
-        { "preserve-fds", OPTION_PRESERVE_FDS, "N", 0, "pass additional FDs to the container", 0 },
-        { "no-pivot", OPTION_NO_PIVOT, 0, 0, "do not use pivot_root", 0 },
-        { "pid-file", OPTION_PID_FILE, "FILE", 0, "where to write the PID of the container", 0 },
-        { "no-subreaper", OPTION_NO_SUBREAPER, 0, 0, "do not create a subreaper process (ignored)", 0 },
-        { "no-new-keyring", OPTION_NO_NEW_KEYRING, 0, 0, "keep the same session key", 0 },
         {
             0,
         } };
@@ -74,6 +79,8 @@ static char args_doc[] = "split [OPTION]... CONTAINER";
 static error_t
 parse_opt (int key, char *arg, struct argp_state *state)
 {
+  (void) arg;
+
   switch (key)
     {
     case 'b':
@@ -87,27 +94,28 @@ parse_opt (int key, char *arg, struct argp_state *state)
       from_id = argp_mandatory_argument (arg, state);
       break;
 
-    case OPTION_CONSOLE_SOCKET:
-      crun_context.console_socket = argp_mandatory_argument (arg, state);
+    case OPTION_SHARE_NETWORK:
+      share_network = true;
       break;
 
-    case OPTION_PRESERVE_FDS:
-      crun_context.preserve_fds = parse_int_or_fail (argp_mandatory_argument (arg, state), "preserve-fds");
+    case OPTION_SHARE_IPC:
+      share_ipc = true;
       break;
 
-    case OPTION_NO_SUBREAPER:
+    case OPTION_SHARE_UTS:
+      share_uts = true;
       break;
 
-    case OPTION_NO_PIVOT:
-      crun_context.no_pivot = true;
+    case OPTION_SHARE_PID:
+      share_pid = true;
       break;
 
-    case OPTION_NO_NEW_KEYRING:
-      crun_context.no_new_keyring = true;
+    case OPTION_SHARE_USER:
+      share_user = true;
       break;
 
-    case OPTION_PID_FILE:
-      crun_context.pid_file = argp_mandatory_argument (arg, state);
+    case OPTION_SHARE_CGROUP:
+      share_cgroup = true;
       break;
 
     case ARGP_KEY_NO_ARGS:
@@ -153,8 +161,43 @@ setup_overlayfs_rootfs (const char *parent_rootfs, const char *overlay_rootfs, c
 }
 
 static int
-copy_config_with_new_rootfs (const char *parent_config_path, const char *child_config_path, const char *child_rootfs,
-                             libcrun_error_t *err)
+set_namespace_path (json_object *linux_obj, const char *type, const char *path)
+{
+  json_object *ns_array;
+  if (! json_object_object_get_ex (linux_obj, "namespaces", &ns_array))
+    {
+      ns_array = json_object_new_array ();
+      json_object_object_add (linux_obj, "namespaces", ns_array);
+    }
+
+  size_t len = json_object_array_length (ns_array);
+  size_t i;
+  for (i = 0; i < len; i++)
+    {
+      json_object *ns = json_object_array_get_idx (ns_array, i);
+      json_object *type_obj;
+      if (json_object_object_get_ex (ns, "type", &type_obj))
+        {
+          if (strcmp (json_object_get_string (type_obj), type) == 0)
+            {
+              json_object_object_add (ns, "path", json_object_new_string (path));
+              return 0;
+            }
+        }
+    }
+
+  /* Not found, append new namespace entry with path.  */
+  json_object *ns = json_object_new_object ();
+  json_object_object_add (ns, "type", json_object_new_string (type));
+  json_object_object_add (ns, "path", json_object_new_string (path));
+  json_object_array_add (ns_array, ns);
+  return 0;
+}
+
+static int
+copy_config_with_new_rootfs_and_namespaces (const char *parent_config_path, const char *child_config_path,
+                                            const char *child_rootfs, pid_t parent_pid,
+                                            libcrun_error_t *err)
 {
   json_object *jobj = NULL;
   int ret;
@@ -170,6 +213,56 @@ copy_config_with_new_rootfs (const char *parent_config_path, const char *child_c
       json_object_object_add (root_obj, "path", path_obj);
     }
 
+  if (parent_pid > 0)
+    {
+      json_object *linux_obj;
+      if (json_object_object_get_ex (jobj, "linux", &linux_obj))
+        {
+          if (share_network)
+            {
+              cleanup_free char *ns_path = NULL;
+              ret = asprintf (&ns_path, "/proc/%d/ns/net", parent_pid);
+              if (ret >= 0)
+                set_namespace_path (linux_obj, "network", ns_path);
+            }
+          if (share_ipc)
+            {
+              cleanup_free char *ns_path = NULL;
+              ret = asprintf (&ns_path, "/proc/%d/ns/ipc", parent_pid);
+              if (ret >= 0)
+                set_namespace_path (linux_obj, "ipc", ns_path);
+            }
+          if (share_uts)
+            {
+              cleanup_free char *ns_path = NULL;
+              ret = asprintf (&ns_path, "/proc/%d/ns/uts", parent_pid);
+              if (ret >= 0)
+                set_namespace_path (linux_obj, "uts", ns_path);
+            }
+          if (share_pid)
+            {
+              cleanup_free char *ns_path = NULL;
+              ret = asprintf (&ns_path, "/proc/%d/ns/pid", parent_pid);
+              if (ret >= 0)
+                set_namespace_path (linux_obj, "pid", ns_path);
+            }
+          if (share_user)
+            {
+              cleanup_free char *ns_path = NULL;
+              ret = asprintf (&ns_path, "/proc/%d/ns/user", parent_pid);
+              if (ret >= 0)
+                set_namespace_path (linux_obj, "user", ns_path);
+            }
+          if (share_cgroup)
+            {
+              cleanup_free char *ns_path = NULL;
+              ret = asprintf (&ns_path, "/proc/%d/ns/cgroup", parent_pid);
+              if (ret >= 0)
+                set_namespace_path (linux_obj, "cgroup", ns_path);
+            }
+        }
+    }
+
   ret = json_object_to_file_ext (child_config_path, jobj, JSON_C_TO_STRING_PRETTY);
   json_object_put (jobj);
 
@@ -183,17 +276,15 @@ static int
 write_split_status (const char *state_root, const char *child_id, const char *from_id, const char *overlay_rootfs,
                     libcrun_error_t *err)
 {
-  cleanup_free char *status_file = NULL;
+  cleanup_free char *state_dir = NULL;
   int ret;
 
-  /* Build the path to the status file manually.  Status dir was already
-     created during container creation.  */
-  ret = libcrun_get_state_directory (&status_file, state_root, child_id, err);
+  ret = libcrun_get_state_directory (&state_dir, state_root, child_id, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
   cleanup_free char *extra_file = NULL;
-  ret = append_paths (&extra_file, err, status_file, "status.extra", NULL);
+  ret = append_paths (&extra_file, err, state_dir, "status.extra", NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -202,6 +293,19 @@ write_split_status (const char *state_root, const char *child_id, const char *fr
   json_object_object_add (jobj, "split-from", json_object_new_string (from_id));
   json_object_object_add (jobj, "cow-rootfs", json_object_new_boolean (true));
   json_object_object_add (jobj, "overlay-rootfs", json_object_new_string (overlay_rootfs));
+
+  if (share_network)
+    json_object_object_add (jobj, "share-network", json_object_new_boolean (true));
+  if (share_ipc)
+    json_object_object_add (jobj, "share-ipc", json_object_new_boolean (true));
+  if (share_uts)
+    json_object_object_add (jobj, "share-uts", json_object_new_boolean (true));
+  if (share_pid)
+    json_object_object_add (jobj, "share-pid", json_object_new_boolean (true));
+  if (share_user)
+    json_object_object_add (jobj, "share-user", json_object_new_boolean (true));
+  if (share_cgroup)
+    json_object_object_add (jobj, "share-cgroup", json_object_new_boolean (true));
 
   const char *json_str = json_object_to_json_string_ext (jobj, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
 
@@ -265,7 +369,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
       bundle = bundle_cleanup;
     }
 
-  /* Read parent container status to get its rootfs and bundle.  */
+  /* Read parent container status to get its rootfs, bundle, and pid.  */
   libcrun_container_status_t parent_status = { 0 };
   ret = libcrun_read_container_status (&parent_status, global_args->root, from_id, err);
   if (UNLIKELY (ret < 0))
@@ -273,6 +377,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
 
   parent_bundle = xstrdup (parent_status.bundle);
   parent_rootfs = xstrdup (parent_status.rootfs);
+  pid_t parent_pid = parent_status.pid;
   libcrun_free_container_status (&parent_status);
 
   /* Build child bundle.  */
@@ -320,7 +425,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = copy_config_with_new_rootfs (parent_config, child_config, child_overlay_rootfs, err);
+  ret = copy_config_with_new_rootfs_and_namespaces (parent_config, child_config, child_overlay_rootfs, parent_pid, err);
   if (UNLIKELY (ret < 0))
     goto fail_unmount;
 

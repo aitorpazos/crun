@@ -113,6 +113,7 @@ extern int crun_command_split (struct crun_global_arguments *, int, char **, lib
 int
 crun_command_fork (struct crun_global_arguments *global_args, int argc, char **argv, libcrun_error_t *err)
 {
+  (void) err;
   int first_arg;
   int ret;
 
@@ -133,8 +134,7 @@ crun_command_fork (struct crun_global_arguments *global_args, int argc, char **a
       if (UNLIKELY (ret < 0))
         OOM ();
 
-      /* Count split_argv pieces.  "crun" + "split" + "--from=X" + PREFIX.  */
-      size_t split_argc = 4;
+      size_t split_argc = 3;
       if (share_network)
         split_argc++;
       if (share_ipc)
@@ -145,7 +145,6 @@ crun_command_fork (struct crun_global_arguments *global_args, int argc, char **a
       char **split_argv = xmalloc0 ((split_argc + 1) * sizeof (char *));
       size_t pos = 0;
       split_argv[pos++] = xstrdup (argv[0] ? argv[0] : "crun");
-      split_argv[pos++] = xstrdup ("split");
       split_argv[pos++] = xstrdup ("--from");
       split_argv[pos++] = xstrdup (from_id);
 
@@ -176,7 +175,6 @@ crun_command_fork (struct crun_global_arguments *global_args, int argc, char **a
 
       succeeded++;
 
-      /* Spawn detached watcher for TTL auto-cleanup.  */
       if (ttl > 0)
         {
           pid_t watcher = fork ();
@@ -184,11 +182,10 @@ crun_command_fork (struct crun_global_arguments *global_args, int argc, char **a
             {
               sleep (ttl);
               cleanup_free char *del_argv0 = xstrdup (argv[0]);
-              cleanup_free char *del_cmd = xstrdup ("delete");
               cleanup_free char *del_id = xstrdup (child_name);
-              char *del_argv[] = { del_argv0, del_cmd, del_id, NULL };
+              char *del_argv[] = { del_argv0, del_id, NULL };
               libcrun_error_t del_err = NULL;
-              crun_command_delete (global_args, 3, del_argv, &del_err);
+              crun_command_delete (global_args, 2, del_argv, &del_err);
               if (del_err)
                 libcrun_error_release (&del_err);
               _exit (0);

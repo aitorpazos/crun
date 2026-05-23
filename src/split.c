@@ -350,7 +350,7 @@ split_container_via_criu (struct crun_global_arguments *global_args,
   cleanup_free char *parent_config = NULL;
   int ret;
 
-  ret = append_paths (&checkpoint_dir, err, child_state_dir, "criu", NULL);
+  ret = append_paths (&checkpoint_dir, err, child_bundle, ".split-criu", NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -463,6 +463,9 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   int ret;
   int first_arg;
 
+  /* Reset per-invocation static state for reuse by fork(2) caller.  */
+  bundle = NULL;
+
   argp_parse (&run_argp, argc, argv, ARGP_IN_ORDER, &first_arg, &crun_context);
   crun_assert_n_args (argc - first_arg, 1, 1);
 
@@ -511,11 +514,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = libcrun_get_state_directory (&child_state_dir, global_args->root, child_id, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  ret = crun_ensure_directory (child_state_dir, 0700, false, err);
+  ret = append_paths (&child_state_dir, err, global_args->root, child_id, NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -540,11 +539,11 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
     }
 
   /* Non-CRIU path: overlayfs for COW storage.  */
-  ret = append_paths (&upperdir, err, child_state_dir, "overlay-upper", NULL);
+  ret = append_paths (&upperdir, err, child_bundle, ".split-overlay-upper", NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = append_paths (&workdir, err, child_state_dir, "overlay-work", NULL);
+  ret = append_paths (&workdir, err, child_bundle, ".split-overlay-work", NULL);
   if (UNLIKELY (ret < 0))
     return ret;
 

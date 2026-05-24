@@ -580,6 +580,10 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   if (UNLIKELY (ret < 0))
     goto fail_unmount;
 
+  ret = libcrun_container_start (&crun_context, child_id, err);
+  if (UNLIKELY (ret < 0))
+    goto fail_unmount;
+
   ret = write_split_status (global_args->root, child_id, from_id, child_overlay_rootfs, false, err);
   if (UNLIKELY (ret < 0))
     goto fail_unmount;

@@ -496,10 +496,28 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   if (UNLIKELY (ret < 0))
     return ret;
 
+  ret = libcrun_is_container_running (&parent_status, err);
+  if (ret <= 0)
+    {
+      libcrun_free_container_status (&parent_status);
+      return crun_make_error (err, 0, "parent container `%s` is not running", from_id);
+    }
+
   parent_bundle = xstrdup (parent_status.bundle);
   parent_rootfs = xstrdup (parent_status.rootfs);
   pid_t parent_pid = parent_status.pid;
   libcrun_free_container_status (&parent_status);
+
+  /* Resolve parent rootfs to absolute path for overlayfs mount(2).
+     Status stores it relative to bundle; overlayfs lowerdir= requires absolute.  */
+  if (parent_rootfs != NULL && parent_rootfs[0] != '\0' && parent_rootfs[0] != '/')
+    {
+      cleanup_free char *abs_rootfs = NULL;
+      ret = append_paths (&abs_rootfs, err, parent_bundle, parent_rootfs, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+      parent_rootfs = xstrdup (abs_rootfs);
+    }
 
   /* Build child bundle and state dir (used for both overlay and criu paths).  */
   ret = append_paths (&child_bundle, err, bundle, child_id, NULL);

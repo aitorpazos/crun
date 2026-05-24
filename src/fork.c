@@ -41,11 +41,13 @@ enum
   OPTION_SHARE_NETWORK,
   OPTION_SHARE_IPC,
   OPTION_CRIU,
+  OPTION_BUNDLE,
 };
 
 static const char *from_id = NULL;
 static int count = 1;
 static int ttl = 0;
+static const char *bundle_path = NULL;
 static bool share_network = false;
 static bool share_ipc = false;
 static bool use_criu = false;
@@ -57,6 +59,7 @@ static struct argp_option options[]
         { "share-network", OPTION_SHARE_NETWORK, 0, 0, "share parent's network namespace", 0 },
         { "share-ipc", OPTION_SHARE_IPC, 0, 0, "share parent's IPC namespace", 0 },
         { "criu", OPTION_CRIU, 0, 0, "use CRIU for memory COW", 0 },
+        { "bundle", OPTION_BUNDLE, "DIR", 0, "base bundle directory for child containers", 0 },
         { 0 } };
 
 static char doc[] = "OCI runtime";
@@ -93,6 +96,10 @@ parse_opt (int key, char *arg, struct argp_state *state)
 
     case OPTION_CRIU:
       use_criu = true;
+      break;
+
+    case OPTION_BUNDLE:
+      bundle_path = argp_mandatory_argument (arg, state);
       break;
 
     case ARGP_KEY_NO_ARGS:
@@ -135,6 +142,8 @@ crun_command_fork (struct crun_global_arguments *global_args, int argc, char **a
         OOM ();
 
       size_t split_argc = 3;
+      if (bundle_path)
+        split_argc += 2;
       if (share_network)
         split_argc++;
       if (share_ipc)
@@ -147,6 +156,12 @@ crun_command_fork (struct crun_global_arguments *global_args, int argc, char **a
       split_argv[pos++] = xstrdup (argv[0] ? argv[0] : "crun");
       split_argv[pos++] = xstrdup ("--from");
       split_argv[pos++] = xstrdup (from_id);
+
+      if (bundle_path)
+        {
+          split_argv[pos++] = xstrdup ("--bundle");
+          split_argv[pos++] = xstrdup (bundle_path);
+        }
 
       if (share_network)
         split_argv[pos++] = xstrdup ("--share-network");

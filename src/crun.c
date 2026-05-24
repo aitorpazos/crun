@@ -52,6 +52,8 @@
 #include "checkpoint.h"
 #include "mounts.h"
 #include "restore.h"
+#include "split.h"
+#include "fork.h"
 
 static struct crun_global_arguments arguments;
 
@@ -149,6 +151,8 @@ enum
   COMMAND_CHECKPOINT,
   COMMAND_RESTORE,
   COMMAND_MOUNTS,
+  COMMAND_SPLIT,
+  COMMAND_FORK,
 };
 
 struct commands_s commands[] = { { COMMAND_CREATE, "create", crun_command_create },
@@ -170,6 +174,8 @@ struct commands_s commands[] = { { COMMAND_CREATE, "create", crun_command_create
                                  { COMMAND_RESTORE, "restore", crun_command_restore },
 #endif
                                  { COMMAND_MOUNTS, "mounts", crun_command_mounts },
+                                 { COMMAND_SPLIT, "split", crun_command_split },
+                                 { COMMAND_FORK, "fork", crun_command_fork },
                                  {
                                      0,
                                  } };
@@ -190,6 +196,8 @@ static char doc[] = "\nCOMMANDS:\n"
                     "\trestore     - restore a container\n"
 #endif
                     "\trun         - run a container\n"
+                    "\tsplit       - split a container from a parent with COW overlayfs\n"
+                    "\tfork        - fork N children from a parent with optional TTL\n"
                     "\tspec        - generate a configuration file\n"
                     "\tstart       - start a container\n"
                     "\tstate       - output the state of a container\n"

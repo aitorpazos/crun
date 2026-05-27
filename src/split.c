@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/mount.h>
@@ -462,6 +464,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   const char *config_file = "config.json";
   int ret;
   int first_arg;
+  bool parent_is_krun = false;
 
   /* Reset per-invocation static state for reuse by fork(2) caller.  */
   bundle = NULL;
@@ -497,10 +500,29 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
     return ret;
 
   ret = libcrun_is_container_running (&parent_status, err);
-  if (ret <= 0)
+  parent_is_krun = parent_status.handler_name && strcmp (parent_status.handler_name, "krun") == 0;
+  if (ret <= 0 && ! parent_is_krun)
     {
       libcrun_free_container_status (&parent_status);
       return crun_make_error (err, 0, "parent container `%s` is not running", from_id);
+    }
+  else if (ret <= 0 && parent_is_krun)
+    {
+      /* 2026-05-26: For libkrun containers the VM init process may exit,
+         but an agent socket remains for hot-fork branching.  If the socket
+         exists, treat the parent as alive for split.  */
+      cleanup_free char *fallback_sock = NULL;
+      if (asprintf (&fallback_sock, "/proc/%d/root/tmp/krun.branch.%s.fifo", (int) parent_status.pid, from_id) < 0)
+        {
+          libcrun_free_container_status (&parent_status);
+          return crun_make_error (err, 0, "parent container `%s` is not running (socket alloc failed)", from_id);
+        }
+      struct stat st; if (stat (fallback_sock, &st) != 0 || ! S_ISFIFO (st.st_mode))
+        {
+          libcrun_free_container_status (&parent_status);
+          return crun_make_error (err, 0, "parent container `%s` is not running", from_id);
+        }
+      /* Socket exists; fall through to hot-fork path.  */
     }
 
   parent_bundle = xstrdup (parent_status.bundle);
@@ -535,6 +557,68 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
   ret = append_paths (&child_state_dir, err, global_args->root, child_id, NULL);
   if (UNLIKELY (ret < 0))
     return ret;
+
+  /* Fast path: krun hot-fork via FIFO inside VM process (/proc/<pid>/root/tmp).
+     The listener runs in the VM child process, sharing LIVE_VMMS.  */
+  if (parent_is_krun)
+    {
+      cleanup_free char *fifo_path = NULL;
+      if (asprintf (&fifo_path, "/proc/%d/root/tmp/krun.branch.%s.fifo",
+                    (int) parent_pid, from_id) >= 0)
+        {
+          /* Wait up to 5 s for FIFO to appear.  */
+          for (int tries = 0; tries < 50; tries++)
+            {
+              struct stat st;
+              if (stat (fifo_path, &st) == 0 && S_ISFIFO (st.st_mode))
+                break;
+              usleep (100000);
+            }
+          int fd = open (fifo_path, O_WRONLY | O_NONBLOCK);
+          if (fd >= 0)
+            {
+              /* Remove O_NONBLOCK so write blocks until reader opens.  */
+              fcntl (fd, F_SETFL, fcntl (fd, F_GETFL) & ~O_NONBLOCK);
+              cleanup_free char *req = NULL;
+              int reqn = asprintf (&req, "%s\n%s\n", child_id, child_state_dir);
+              if (reqn > 0)
+                {
+                  (void) write (fd, req, reqn);
+                  close (fd);
+
+                  /* Read result from the container's tmpfs via proc.  */
+                  cleanup_free char *rr_path = NULL;
+                  if (asprintf (&rr_path, "/proc/%d/root/tmp/krun.branch.result.%s",
+                                (int) parent_pid, child_id) >= 0)
+                    {
+                      char resp[128] = {0};
+                      int rn = -1;
+                      for (int tries = 0; tries < 50; tries++)
+                        {
+                          int rfd = open (rr_path, O_RDONLY | O_NONBLOCK);
+                          if (rfd >= 0)
+                            {
+                              rn = read (rfd, resp, sizeof (resp) - 1);
+                              close (rfd);
+                              if (rn > 0)
+                                break;
+                            }
+                          usleep (100000);
+                        }
+                      if (rn > 0 && strncmp (resp, "OK ", 3) == 0)
+                        {
+                          /* Child VM was branched successfully; listener in the
+                             VM process will run krun_start_enter for the child.  */
+                          return 0;
+                        }
+                    }
+                }
+              else
+                close (fd);
+            }
+        }
+      /* FIFO not reachable or branch returned error -- fall through.  */
+    }
 
   if (use_criu)
     {
@@ -586,6 +670,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
     goto fail_unmount;
 
   crun_context.bundle = child_bundle;
+
 
   container = libcrun_container_load_from_file (child_config, err);
   if (container == NULL)

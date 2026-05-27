@@ -88,6 +88,7 @@ struct krun_config
   json_object *config_doc;
   json_object *config_tree;
   bool use_passt;
+  char container_id[128];
 };
 
 /* libkrun handler.  */
@@ -416,6 +417,13 @@ libkrun_configure_flavor (void *cookie, json_object *config_tree, libcrun_contai
   return 0;
 }
 
+struct branch_listener_info
+{
+  void *handle;
+  char container_id[128];
+};
+static void *libcrun_krun_branch_listener (void *arg);
+
 static int
 libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname, char *const argv[])
 {
@@ -543,11 +551,115 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
 
   json_object_put (kconf->config_doc);
 
+  /* Spawn a FIFO listener in the VM process so krun_branch_ctx accesses
+     the same process-local LIVE_VMMS map.  */
+  {
+    struct branch_listener_info blinfo;
+    blinfo.handle = handle;
+    strncpy (blinfo.container_id, kconf->container_id, sizeof (blinfo.container_id) - 1);
+    blinfo.container_id[sizeof (blinfo.container_id) - 1] = '\0';
+    pthread_t bl_tid;
+    if (pthread_create (&bl_tid, NULL, libcrun_krun_branch_listener, &blinfo) == 0)
+      pthread_detach (bl_tid);
+  }
+
   ret = krun_start_enter (ctx_id);
   if (UNLIKELY (ret < 0))
     error (EXIT_FAILURE, -ret, "could not start krun");
 
   return ret;
+}
+
+/* Branch listener: reads branch requests from a FIFO and calls krun_branch_ctx
+   in the same process owning LIVE_VMMS.  Results written to a result file.  */
+
+static void *
+libcrun_krun_branch_listener (void *arg)
+{
+  struct branch_listener_info *info = (struct branch_listener_info *) arg;
+  void *handle = info->handle;
+  char container_id[128];
+  strncpy (container_id, info->container_id, sizeof (container_id) - 1);
+  container_id[sizeof (container_id) - 1] = '\0';
+
+  int32_t (*krun_branch) (uint32_t) = dlsym (handle, "krun_branch_ctx");
+  if (!krun_branch)
+    return NULL;
+
+  cleanup_free char *fifo_path = NULL;
+  if (asprintf (&fifo_path, "/tmp/krun.branch.%s.fifo", container_id) < 0)
+    return NULL;
+
+  (void) mkfifo (fifo_path, 0666);
+
+  while (1)
+    {
+      int fd = open (fifo_path, O_RDONLY);
+      if (fd < 0)
+        {
+          if (errno == ENOENT)
+            break;
+          if (errno == EINTR)
+            continue;
+          break;
+        }
+
+      char buf[4096] = {0};
+      int total = 0;
+      while (total < sizeof (buf) - 1)
+        {
+          int rn = read (fd, buf + total, sizeof (buf) - 1 - total);
+          if (rn <= 0)
+            break;
+          total += rn;
+        }
+      close (fd);
+
+      if (total <= 0)
+        continue;
+
+      char *nl = strchr (buf, '\n');
+      if (!nl)
+        continue;
+      *nl = '\0';
+      char *child_id = buf;
+      char *child_state_dir = nl + 1;
+      char *nl2 = strchr (child_state_dir, '\n');
+      if (nl2) *nl2 = '\0';
+
+      int32_t child_ctx = krun_branch (0);
+      if (child_ctx >= 0)
+        {
+          cleanup_free char *rr_path = NULL;
+          char resp[256];
+          int rn2 = snprintf (resp, sizeof (resp), "OK %d", child_ctx);
+          if (asprintf (&rr_path, "/tmp/krun.branch.result.%s", child_id) > 0)
+            {
+              int rfd = open (rr_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+              if (rfd >= 0)
+                {
+                  (void) write (rfd, resp, rn2);
+                  close (rfd);
+                }
+            }
+        }
+      else
+        {
+          cleanup_free char *rr_path = NULL;
+          if (asprintf (&rr_path, "/tmp/krun.branch.result.%s", child_id) > 0)
+            {
+              int rfd = open (rr_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+              if (rfd >= 0)
+                {
+                  (void) write (rfd, "ERR branch", 10);
+                  close (rfd);
+                }
+            }
+        }
+    }
+
+  unlink (fifo_path);
+  return NULL;
 }
 
 static int
@@ -657,6 +769,11 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       cleanup_close int fd = -1;
       size_t config_size;
 
+      if (context && context->id)
+        {
+          strncpy (kconf->container_id, context->id, sizeof (kconf->container_id) - 1);
+          kconf->container_id[sizeof (kconf->container_id) - 1] = '\0';
+        }
       ret = libcrun_get_state_directory (&state_dir, context->state_root, context->id, err);
       if (UNLIKELY (ret < 0))
         return ret;

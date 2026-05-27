@@ -551,6 +551,34 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
 
   json_object_put (kconf->config_doc);
 
+  /* Write handler sidecars so crun split can identify this as krun.  */
+  {
+    cleanup_free char *path = NULL;
+    int ctx_fd;
+    char buf[32];
+    int bn;
+    if (asprintf (&path, "/tmp/krun.ctx_id.%s", kconf->container_id) >= 0)
+      {
+        ctx_fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ctx_fd >= 0)
+          {
+            bn = snprintf (buf, sizeof (buf), "%d", ctx_id);
+            (void) write (ctx_fd, buf, bn);
+            close (ctx_fd);
+          }
+      }
+    if (asprintf (&path, "/tmp/krun.handler.%s", kconf->container_id) >= 0)
+      {
+        ctx_fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ctx_fd >= 0)
+          {
+            (void) write (ctx_fd, "krun
+", 5);
+            close (ctx_fd);
+          }
+      }
+  }
+
   /* Spawn a FIFO listener in the VM process so krun_branch_ctx accesses
      the same process-local LIVE_VMMS map.  */
   {

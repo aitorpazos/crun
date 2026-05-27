@@ -500,6 +500,39 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
     return ret;
 
   ret = libcrun_is_container_running (&parent_status, err);
+  if (! parent_status.handler_name)
+    {
+      /* Sidecar fallback for older status files without handler_name.  */
+      cleanup_free char *sidecar_path = NULL;
+      if (asprintf (&sidecar_path, "/proc/%d/root/tmp/krun.handler.%s",
+                    (int) parent_status.pid, from_id) >= 0)
+        {
+          cleanup_close int hsfd = open (sidecar_path, O_RDONLY);
+          if (hsfd >= 0)
+            {
+              char hbuf[32] = {0};
+              int hrn = read (hsfd, hbuf, sizeof (hbuf) - 1);
+              if (hrn > 0)
+                {
+                  char *n = strchr (hbuf, '\n'); if (n) *n = '\0';
+                  parent_status.handler_name = xstrdup (hbuf);
+                }
+            }
+        }
+      if (asprintf (&sidecar_path, "/proc/%d/root/tmp/krun.ctx_id.%s",
+                    (int) parent_status.pid, from_id) >= 0)
+        {
+          cleanup_close int csfd = open (sidecar_path, O_RDONLY);
+          if (csfd >= 0)
+            {
+              char cbuf[32] = {0};
+              int crn = read (csfd, cbuf, sizeof (cbuf) - 1);
+              if (crn > 0)
+                parent_status.handler_ctx_id = (uint32_t) strtoul (cbuf, NULL, 10);
+            }
+        }
+    }
+
   parent_is_krun = parent_status.handler_name && strcmp (parent_status.handler_name, "krun") == 0;
   if (ret <= 0 && ! parent_is_krun)
     {
@@ -517,7 +550,28 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
           libcrun_free_container_status (&parent_status);
           return crun_make_error (err, 0, "parent container `%s` is not running (socket alloc failed)", from_id);
         }
-      struct stat st; if (stat (fallback_sock, &st) != 0 || ! S_ISFIFO (st.st_mode))
+      struct stat st;
+      if (stat (fallback_sock, &st) == 0 && S_ISFIFO (st.st_mode))
+        {
+          /* Validate krun parent by reading handler sidecar via proc.  */
+          cleanup_free char *sidecar_path = NULL;
+          if (asprintf (&sidecar_path, "/proc/%d/root/tmp/krun.handler.%s",
+                        (int) parent_status.pid, from_id) >= 0)
+            {
+              cleanup_close int hsfd = open (sidecar_path, O_RDONLY);
+              if (hsfd >= 0)
+                {
+                  char hbuf[32] = {0};
+                  int hrn = read (hsfd, hbuf, sizeof (hbuf) - 1);
+                  if (hrn > 0)
+                    {
+                      char *n = strchr (hbuf, '\n'); if (n) *n = '\0';
+                      parent_status.handler_name = xstrdup (hbuf);
+                    }
+                }
+            }
+        }
+      else
         {
           libcrun_free_container_status (&parent_status);
           return crun_make_error (err, 0, "parent container `%s` is not running", from_id);

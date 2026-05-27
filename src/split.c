@@ -533,20 +533,6 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
         }
     }
 
-  {
-    int diag_fd = open ("/tmp/split.hotfork.trace", O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (diag_fd >= 0)
-      {
-        char diag_buf[512];
-        int diag_n = snprintf (diag_buf, sizeof (diag_buf),
-                               "[split] handler=%s ret=%d pid=%d
-",
-                               parent_status.handler_name ? parent_status.handler_name : "(null)",
-                               ret, (int) parent_status.pid);
-        (void) write (diag_fd, diag_buf, diag_n);
-        close (diag_fd);
-      }
-  }
   parent_is_krun = parent_status.handler_name && strcmp (parent_status.handler_name, "krun") == 0;
   if (ret <= 0 && ! parent_is_krun)
     {
@@ -630,15 +616,6 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
      The listener runs in the VM child process, sharing LIVE_VMMS.  */
   if (parent_is_krun)
     {
-      {
-        int diag_fd = open ("/tmp/split.hotfork.trace", O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (diag_fd >= 0)
-          {
-            (void) write (diag_fd, "[split] entering hot-fork block
-", 32);
-            close (diag_fd);
-          }
-      }
       cleanup_free char *fifo_path = NULL;
       if (asprintf (&fifo_path, "/proc/%d/root/tmp/krun.branch.%s.fifo",
                     (int) parent_pid, from_id) >= 0)

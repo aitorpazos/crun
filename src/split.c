@@ -500,41 +500,6 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
     return ret;
 
   ret = libcrun_is_container_running (&parent_status, err);
-
-  /* Sidecar fallback: if status JSON was written by an older crun without
-     handler_name, read the handler sidecar files written by the handler.  */
-  if (! parent_status.handler_name)
-    {
-      cleanup_free char *sidecar = NULL;
-      if (asprintf (&sidecar, "/tmp/krun.handler.%s", from_id) >= 0)
-        {
-          cleanup_close int hsfd = open (sidecar, O_RDONLY);
-          if (hsfd >= 0)
-            {
-              char hbuf[32] = {0};
-              int hrn = read (hsfd, hbuf, sizeof (hbuf) - 1);
-              if (hrn > 0)
-                {
-                  /* trim newline */
-                  char *n = strchr (hbuf, '
-'); if (n) *n = ' ';
-                  parent_status.handler_name = xstrdup (hbuf);
-                }
-            }
-        }
-      if (asprintf (&sidecar, "/tmp/krun.ctx_id.%s", from_id) >= 0)
-        {
-          cleanup_close int hsfd = open (sidecar, O_RDONLY);
-          if (hsfd >= 0)
-            {
-              char hbuf[32] = {0};
-              int hrn = read (hsfd, hbuf, sizeof (hbuf) - 1);
-              if (hrn > 0)
-                parent_status.handler_ctx_id = (uint32_t) strtoul (hbuf, NULL, 10);
-            }
-        }
-    }
-
   parent_is_krun = parent_status.handler_name && strcmp (parent_status.handler_name, "krun") == 0;
   if (ret <= 0 && ! parent_is_krun)
     {

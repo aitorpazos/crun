@@ -628,7 +628,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                 break;
               usleep (100000);
             }
-          int fd = open (fifo_path, O_WRONLY | O_NONBLOCK);
+          int fd = open (fifo_path, O_WRONLY);
           if (fd >= 0)
             {
               /* Remove O_NONBLOCK so write blocks until reader opens.  */

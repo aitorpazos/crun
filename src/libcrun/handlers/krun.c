@@ -858,6 +858,7 @@ libcrun_krun_child_starter (void *arg)
     }
 
   free (csa);
+  prctl (PR_SET_PDEATHSIG, SIGKILL);
   prctl (PR_SET_NAME, "krun-child");
   int fd = open ("/tmp/branch_listener_child.trace",
                  O_WRONLY | O_CREAT | O_APPEND, 0666);

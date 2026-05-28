@@ -863,8 +863,15 @@ libcrun_krun_child_starter (void *arg)
     cleanup_free char *npath = NULL;
     if (asprintf (&npath, "/tmp/krun.branch.nocleanup.%s", cid_copy) > 0)
       {
-        if (access (npath, F_OK) != 0)
-          prctl (PR_SET_PDEATHSIG, SIGKILL);
+        if (access (npath, F_OK) == 0)
+          {
+            /* Decouple child from parent PID namespace so it survives parent exit.  */
+            (void) unshare (CLONE_NEWPID);
+          }
+        else
+          {
+            prctl (PR_SET_PDEATHSIG, SIGKILL);
+          }
       }
     else
       {

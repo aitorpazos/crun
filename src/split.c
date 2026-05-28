@@ -49,6 +49,7 @@ enum
   OPTION_SHARE_USER,
   OPTION_SHARE_CGROUP,
   OPTION_CRIU,
+  OPTION_NO_CLEANUP,
 };
 
 static const char *bundle = NULL;
@@ -60,6 +61,7 @@ static bool share_pid = false;
 static bool share_user = false;
 static bool share_cgroup = false;
 static bool use_criu = false;
+static bool no_cleanup = false;
 
 static libcrun_context_t crun_context;
 
@@ -72,6 +74,7 @@ static struct argp_option options[]
         { "share-user", OPTION_SHARE_USER, 0, 0, "share parent's user namespace (setns)", 0 },
         { "share-cgroup", OPTION_SHARE_CGROUP, 0, 0, "share parent's cgroup namespace (setns)", 0 },
         { "criu", OPTION_CRIU, 0, 0, "use CRIU checkpoint/restore for COW memory", 0 },
+        { "no-cleanup", OPTION_NO_CLEANUP, 0, 0, "do not terminate child when parent exits", 0 },
         { "bundle", 'b', "DIR", 0, "container bundle (default \".\")", 0 },
         { "config", 'f', "FILE", 0, "override the config file name", 0 },
         {
@@ -126,6 +129,10 @@ parse_opt (int key, char *arg, struct argp_state *state)
 
     case OPTION_CRIU:
       use_criu = true;
+      break;
+
+    case OPTION_NO_CLEANUP:
+      no_cleanup = true;
       break;
 
     case ARGP_KEY_NO_ARGS:
@@ -641,6 +648,19 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                   close (fd);
 
                   /* Read result from the container's tmpfs via proc.  */
+                  /* Create nocleanup sentinel if requested */
+                  if (no_cleanup)
+                    {
+                      cleanup_free char *npath = NULL;
+                      if (asprintf (&npath, "/proc/%d/root/tmp/krun.branch.nocleanup.%s",
+                                    (int) parent_pid, child_id) > 0)
+                        {
+                          int nfd = open (npath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                          if (nfd >= 0)
+                            close (nfd);
+                        }
+                    }
+
                   cleanup_free char *rr_path = NULL;
                   if (asprintf (&rr_path, "/proc/%d/root/tmp/krun.branch.result.%s",
                                 (int) parent_pid, child_id) >= 0)

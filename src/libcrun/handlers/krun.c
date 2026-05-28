@@ -857,8 +857,20 @@ libcrun_krun_child_starter (void *arg)
       return NULL;
     }
 
-  free (csa);
-  prctl (PR_SET_PDEATHSIG, SIGKILL);
+  {
+    cleanup_free char *cid_copy = xstrdup (csa->container_id);
+    free (csa);
+    cleanup_free char *npath = NULL;
+    if (asprintf (&npath, "/tmp/krun.branch.nocleanup.%s", cid_copy) > 0)
+      {
+        if (access (npath, F_OK) != 0)
+          prctl (PR_SET_PDEATHSIG, SIGKILL);
+      }
+    else
+      {
+        prctl (PR_SET_PDEATHSIG, SIGKILL);
+      }
+  }
   prctl (PR_SET_NAME, "krun-child");
   int fd = open ("/tmp/branch_listener_child.trace",
                  O_WRONLY | O_CREAT | O_APPEND, 0666);

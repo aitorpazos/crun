@@ -50,6 +50,7 @@ enum
 {
   LIST_TABLE = 100,
   LIST_JSON,
+  LIST_TREE,
 };
 
 static struct list_options_s list_options;
@@ -57,6 +58,7 @@ static struct list_options_s list_options;
 static struct argp_option options[]
     = { { "quiet", 'q', 0, 0, "show only IDs", 0 },
         { "format", 'f', "FORMAT", 0, "select one of: table or json (default: \"table\")", 0 },
+        { "tree", 't', 0, 0, "show container tree with parent/child relationships", 0 },
         {
             0,
         } };
@@ -78,6 +80,10 @@ parse_opt (int key, char *arg, struct argp_state *state arg_unused)
         list_options.format = LIST_JSON;
       else
         error (EXIT_FAILURE, 0, "invalid format `%s`", arg);
+      break;
+
+    case 't':
+      list_options.format = LIST_TREE;
       break;
 
     default:
@@ -114,6 +120,59 @@ crun_command_list (struct crun_global_arguments *global_args, int argc, char **a
   ret = libcrun_get_containers_list (&list, crun_context.state_root, err);
   if (UNLIKELY (ret < 0))
     return ret;
+
+  if (list_options.format == LIST_TREE)
+    {
+      /* Build tree from parent links in status files */
+      typedef struct tree_node_s {
+        const char *name;
+        const char *parent;
+        struct tree_node_s *next;
+      } tree_node_t;
+      tree_node_t *tree_nodes = NULL;
+      int tree_count = 0;
+      for (it = list; it; it = it->next)
+        tree_count++;
+      if (tree_count > 0)
+        {
+          tree_nodes = calloc (tree_count, sizeof (tree_node_t));
+          int idx = 0;
+          for (it = list; it; it = it->next)
+            {
+              tree_nodes[idx].name = it->name;
+              idx++;
+            }
+          /* Second pass: read parent from status */
+          idx = 0;
+          for (it = list; it; it = it->next)
+            {
+              libcrun_container_status_t status;
+              if (libcrun_read_container_status (&status, crun_context.state_root, it->name, err) >= 0)
+                {
+                  tree_nodes[idx].parent = status.parent ? strdup (status.parent) : NULL;
+                  libcrun_free_container_status (&status);
+                }
+              idx++;
+            }
+          /* Print tree */
+          for (idx = 0; idx < tree_count; idx++)
+            {
+              if (tree_nodes[idx].parent == NULL)
+                {
+                  printf ("%s\n", tree_nodes[idx].name);
+                  /* Print children */
+                  for (int j = 0; j < tree_count; j++)
+                    if (tree_nodes[j].parent && strcmp (tree_nodes[j].parent, tree_nodes[idx].name) == 0)
+                      printf ("  +- %s\n", tree_nodes[j].name);
+                }
+            }
+          for (idx = 0; idx < tree_count; idx++)
+            free ((char *) tree_nodes[idx].parent);
+          free (tree_nodes);
+        }
+      libcrun_free_containers_list (list);
+      return 0;
+    }
 
   for (it = list; it; it = it->next)
     {

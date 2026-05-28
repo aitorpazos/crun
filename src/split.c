@@ -661,6 +661,58 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                         }
                       if (rn > 0 && strncmp (resp, "OK ", 3) == 0)
                         {
+                          int child_ctx = -1;
+                          pid_t child_pid = -1;
+                          sscanf (resp + 3, "%d", &child_ctx);
+                          /* Poll for child PID via parent's proc fs */
+                          {
+                            cleanup_free char *pid_path = NULL;
+                            int apr = asprintf (&pid_path, "/proc/%d/root/tmp/krun.branch.pid.%s",
+                                        (int) parent_pid, child_id);
+                            if (apr > 0 && pid_path)
+                              {
+                                for (int pt = 0; pt < 30; pt++)
+                                  {
+                                    int pfd = open (pid_path, O_RDONLY);
+                                    if (pfd >= 0)
+                                      {
+                                        char pbuf[32] = {0};
+                                        int prn = read (pfd, pbuf, sizeof (pbuf) - 1);
+                                        close (pfd);
+                                        if (prn > 0)
+                                          {
+                                            child_pid = (pid_t) strtol (pbuf, NULL, 10);
+                                            break;
+                                          }
+                                      }
+                                    usleep (100000);
+                                  }
+                              }
+                          }
+                          /* Write container status so crun list/kill work */
+                          if (child_pid > 0)
+                            {
+                              libcrun_error_t st_err = {0};
+                              cleanup_free char *state_dir = NULL;
+                              if (libcrun_get_state_directory (&state_dir, global_args->root,
+                                                                child_id, &st_err) >= 0)
+                                crun_ensure_directory (state_dir, 0700, false, &st_err);
+                              crun_error_release (&st_err);
+                              libcrun_container_status_t st = {0};
+                              st.pid = child_pid;
+                              st.process_start_time = 0;
+                              st.rootfs = parent_rootfs ? parent_rootfs : "";
+                              st.systemd_cgroup = 0;
+                              st.bundle = child_bundle ? child_bundle : "";
+                              st.detached = 1;
+                              st.handler_name = (char *) "krun";
+                              st.handler_ctx_id = (uint32_t) child_ctx;
+                              st.created = "";
+                              st.external_descriptors = "";
+                              (void) libcrun_write_container_status (global_args->root,
+                                                                      child_id, &st, &st_err);
+                              crun_error_release (&st_err);
+                            }
                           /* Child VM was branched successfully; listener in the
                              VM process will run krun_start_enter for the child.  */
                           return 0;

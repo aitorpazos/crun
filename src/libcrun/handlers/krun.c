@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include "../status.h"
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
@@ -603,6 +604,8 @@ struct child_starter_args
 {
   int32_t child_ctx;
   void *handle;
+  char state_root[256];
+  char container_id[128];
 };
 
 static void *libcrun_krun_child_starter (void *arg);
@@ -711,6 +714,9 @@ libcrun_krun_branch_listener (void *arg)
       char *child_state_dir = nl + 1;
       char *nl2 = strchr (child_state_dir, '\n');
       if (nl2) *nl2 = '\0';
+      char *state_root = nl2 ? nl2 + 1 : "";
+      char *nl3 = strchr (state_root, '\n');
+      if (nl3) *nl3 = '\0';
 
       trace_fd = open ("/tmp/branch_listener.trace", O_WRONLY | O_CREAT | O_APPEND, 0666);
       if (trace_fd >= 0)
@@ -757,6 +763,8 @@ libcrun_krun_branch_listener (void *arg)
                     {
                       csa->child_ctx = child_ctx;
                       csa->handle = handle;
+                      snprintf (csa->state_root, sizeof(csa->state_root), "%s", state_root);
+                      snprintf (csa->container_id, sizeof(csa->container_id), "%s", child_id);
                       pthread_t tid2;
                       pthread_attr_t attr2;
                       pthread_attr_init (&attr2);
@@ -800,11 +808,13 @@ libcrun_krun_child_starter (void *arg)
   struct child_starter_args *csa = arg;
   int32_t child_ctx = csa->child_ctx;
   void *handle = csa->handle;
-  free (csa);
 
   int32_t (*krun_start)(uint32_t) = dlsym (handle, "krun_start_enter");
   if (!krun_start)
-    return NULL;
+    {
+      free (csa);
+      return NULL;
+    }
 
   pid_t pid = fork ();
   if (pid < 0)
@@ -813,6 +823,7 @@ libcrun_krun_child_starter (void *arg)
                      O_WRONLY | O_CREAT | O_APPEND, 0666);
       if (fd >= 0)
         { (void) write (fd, "[ch] fork failed\n", 17); close (fd); }
+      free (csa);
       return NULL;
     }
 
@@ -829,9 +840,24 @@ libcrun_krun_child_starter (void *arg)
           (void) write (fd, buf, n);
           close (fd);
         }
+      /* Write child PID so split.c can create container status */
+      cleanup_free char *pid_path = NULL;
+      if (asprintf (&pid_path, "/tmp/krun.branch.pid.%s", csa->container_id) > 0)
+        {
+          int pfd = open (pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+          if (pfd >= 0)
+            {
+              char pbuf[32];
+              int pn = snprintf (pbuf, sizeof (pbuf), "%d\n", (int) pid);
+              (void) write (pfd, pbuf, pn);
+              close (pfd);
+            }
+        }
+      free (csa);
       return NULL;
     }
 
+  free (csa);
   prctl (PR_SET_NAME, "krun-child");
   int fd = open ("/tmp/branch_listener_child.trace",
                  O_WRONLY | O_CREAT | O_APPEND, 0666);

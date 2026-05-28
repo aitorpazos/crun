@@ -32,6 +32,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <sched.h>
 #include <ocispec/runtime_spec_schema_config_schema.h>
@@ -829,80 +830,87 @@ libcrun_krun_child_starter (void *arg)
 
   if (pid > 0)
     {
-      int fd = open ("/tmp/branch_listener_child.trace",
-                     O_WRONLY | O_CREAT | O_APPEND, 0666);
-      if (fd >= 0)
-        {
-          char buf[256];
-          int n = snprintf (buf, sizeof (buf),
-                            "[ch] child process %d running ctx %d\n",
-                            (int) pid, child_ctx);
-          (void) write (fd, buf, n);
-          close (fd);
-        }
-      /* Write child PID so split.c can create container status */
-      cleanup_free char *pid_path = NULL;
-      if (asprintf (&pid_path, "/tmp/krun.branch.pid.%s", csa->container_id) > 0)
-        {
-          int pfd = open (pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-          if (pfd >= 0)
-            {
-              char pbuf[32];
-              int pn = snprintf (pbuf, sizeof (pbuf), "%d\n", (int) pid);
-              (void) write (pfd, pbuf, pn);
-              close (pfd);
-            }
-        }
+      /* Wait for the intermediate child so it does not become a zombie.  */
+      int wstatus;
+      (void) waitpid (pid, &wstatus, 0);
       free (csa);
       return NULL;
     }
 
+  /* pid == 0: intermediate child.  */
   {
     cleanup_free char *cid_copy = xstrdup (csa->container_id);
     free (csa);
     cleanup_free char *npath = NULL;
+    bool no_cleanup = false;
     if (asprintf (&npath, "/tmp/krun.branch.nocleanup.%s", cid_copy) > 0)
       {
         if (access (npath, F_OK) == 0)
-          {
-            /* Decouple child from parent PID namespace so it survives parent exit.  */
-            (void) unshare (CLONE_NEWPID);
-          }
-        else
-          {
-            prctl (PR_SET_PDEATHSIG, SIGKILL);
-          }
+          no_cleanup = true;
       }
-    else
+
+    if (no_cleanup)
       {
-        prctl (PR_SET_PDEATHSIG, SIGKILL);
+        /* Escape parent PID namespace so grandchild survives parent exit.  */
+        if (unshare (CLONE_NEWPID) == 0)
+          {
+            /* Double-fork: grandchild becomes PID 1 in new namespace.  */
+            pid_t grandchild = fork ();
+            if (grandchild < 0)
+              _exit (1);
+            if (grandchild > 0)
+              {
+                /* Write child PID so split.c can create container status.  */
+                cleanup_free char *pid_path = NULL;
+                if (asprintf (&pid_path, "/tmp/krun.branch.pid.%s", cid_copy) > 0)
+                  {
+                    int pfd = open (pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                    if (pfd >= 0)
+                      {
+                        char pbuf[32];
+                        int pn = snprintf (pbuf, sizeof (pbuf), "%d\n", (int) grandchild);
+                        (void) write (pfd, pbuf, pn);
+                        close (pfd);
+                      }
+                  }
+                _exit (0);
+              }
+
+            /* Grandchild: no PDEATHSIG, new PID ns.  */
+            prctl (PR_SET_NAME, "krun-child");
+            int ret = krun_start ((uint32_t) child_ctx);
+            _exit (ret == 0 ? 0 : 1);
+          }
       }
+
+    /* Normal path: PDEATHSIG kills child when parent exits.  */
+    prctl (PR_SET_PDEATHSIG, SIGKILL);
+    prctl (PR_SET_NAME, "krun-child");
+    int fd = open ("/tmp/branch_listener_child.trace",
+                   O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0)
+      {
+        char buf[256];
+        int n = snprintf (buf, sizeof (buf),
+                          "[ch] child pid %d starting ctx %d\n",
+                          (int) getpid (), child_ctx);
+        (void) write (fd, buf, n);
+        close (fd);
+      }
+    int ret = krun_start ((uint32_t) child_ctx);
+    fd = open ("/tmp/branch_listener_child.trace",
+               O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0)
+      {
+        char buf[256];
+        int n = snprintf (buf, sizeof (buf),
+                          "[ch] child pid %d exited with %d\n",
+                          (int) getpid (), ret);
+        (void) write (fd, buf, n);
+        close (fd);
+      }
+    _exit (ret == 0 ? 0 : 1);
   }
-  prctl (PR_SET_NAME, "krun-child");
-  int fd = open ("/tmp/branch_listener_child.trace",
-                 O_WRONLY | O_CREAT | O_APPEND, 0666);
-  if (fd >= 0)
-    {
-      char buf[256];
-      int n = snprintf (buf, sizeof (buf),
-                        "[ch] child pid %d starting ctx %d\n",
-                        (int) getpid (), child_ctx);
-      (void) write (fd, buf, n);
-      close (fd);
-    }
-  int ret = krun_start ((uint32_t) child_ctx);
-  fd = open ("/tmp/branch_listener_child.trace",
-             O_WRONLY | O_CREAT | O_APPEND, 0666);
-  if (fd >= 0)
-    {
-      char buf[256];
-      int n = snprintf (buf, sizeof (buf),
-                        "[ch] child pid %d exited with %d\n",
-                        (int) getpid (), ret);
-      (void) write (fd, buf, n);
-      close (fd);
-    }
-  _exit (ret == 0 ? 0 : 1);
 }
 
 static int

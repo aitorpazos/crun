@@ -389,6 +389,17 @@ libcrun_write_container_status (const char *state_root, const char *id, libcrun_
         goto gen_error;
     }
 
+
+  if (status->parent)
+    {
+      r = json_gen_string (gen, "parent", strlen ("parent"));
+      if (UNLIKELY (r != json_gen_status_ok))
+        goto gen_error;
+
+      r = json_gen_string (gen, status->parent, strlen (status->parent));
+      if (UNLIKELY (r != json_gen_status_ok))
+        goto gen_error;
+    }
   r = json_gen_map_close (gen);
   if (UNLIKELY (r != json_gen_status_ok))
     goto gen_error;
@@ -580,6 +591,11 @@ libcrun_read_container_status (libcrun_container_status_t *status, const char *s
     status->handler_ctx_id = tmp ? (uint32_t) json_object_get_int64 (tmp) : 0;
   }
   {
+    tmp = json_object_object_get (doc, "parent");
+    val = tmp ? json_object_get_string (tmp) : NULL;
+    status->parent = val ? xstrdup (val) : NULL;
+  }
+  {
     tmp = json_object_object_get (doc, "external_descriptors");
     val = tmp ? json_object_get_string (tmp) : NULL;
     status->external_descriptors = val ? xstrdup (val) : NULL;
@@ -722,6 +738,7 @@ libcrun_free_container_status (libcrun_container_status_t *status)
   free (status->external_descriptors);
   free (status->handler_name);
   free (status->created);
+  free (status->parent);
   free (status->scope);
   free (status->owner);
 }

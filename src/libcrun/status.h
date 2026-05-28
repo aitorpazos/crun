@@ -46,6 +46,7 @@ struct libcrun_container_status_s
   char *handler_name;
   uint32_t handler_ctx_id;
   char *owner;
+  char *parent;
 };
 typedef struct libcrun_container_status_s libcrun_container_status_t;
 

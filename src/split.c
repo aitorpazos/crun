@@ -707,6 +707,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                               st.detached = 1;
                               st.handler_name = (char *) "krun";
                               st.handler_ctx_id = (uint32_t) child_ctx;
+                              st.parent = (char *) from_id;
                               st.created = "";
                               st.external_descriptors = "";
                               (void) libcrun_write_container_status (global_args->root,

@@ -1988,6 +1988,43 @@ write_container_status (libcrun_container_t *container, libcrun_context_t *conte
                         pid_t pid, struct libcrun_cgroup_status *cgroup_status,
                         libcrun_error_t *err)
 {
+  cleanup_free char *handler_name = NULL;
+  uint32_t handler_ctx_id = 0;
+  {
+    cleanup_free char *hf = NULL;
+    if (asprintf (&hf, "/tmp/krun.handler.%s", context->id) > 0)
+      {
+        char buf[32];
+        int hfd = open (hf, O_RDONLY | O_CLOEXEC);
+        if (hfd >= 0)
+          {
+            ssize_t n = read (hfd, buf, sizeof (buf) - 1);
+            if (n > 0)
+              {
+                buf[n] = '\0';
+                char *nl = strchr (buf, '\n');
+                if (nl) *nl = '\0';
+                handler_name = xstrdup (buf);
+              }
+            close (hfd);
+          }
+      }
+    if (asprintf (&hf, "/tmp/krun.ctx_id.%s", context->id) > 0)
+      {
+        int hfd = open (hf, O_RDONLY | O_CLOEXEC);
+        if (hfd >= 0)
+          {
+            char buf2[16];
+            ssize_t n = read (hfd, buf2, sizeof (buf2) - 1);
+            if (n > 0)
+              {
+                buf2[n] = '\0';
+                handler_ctx_id = (uint32_t) strtoul (buf2, NULL, 10);
+              }
+            close (hfd);
+          }
+      }
+  }
   cleanup_free char *cwd = getcwd (NULL, 0);
   if (UNLIKELY (cwd == NULL))
     libcrun_fail_with_error (errno, "getcwd failed");
@@ -2007,6 +2044,8 @@ write_container_status (libcrun_container_t *container, libcrun_context_t *conte
     .external_descriptors = external_descriptors,
     .cgroup_path = NULL,
     .scope = NULL,
+    .handler_name = handler_name,
+    .handler_ctx_id = handler_ctx_id,
   };
 
   get_current_timestamp (created, sizeof (created));

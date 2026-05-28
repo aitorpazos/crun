@@ -23,6 +23,8 @@
 #include "../utils.h"
 #include "../linux.h"
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <errno.h>
@@ -597,6 +599,13 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
   return ret;
 }
 
+struct child_starter_args
+{
+  int32_t child_ctx;
+  void *handle;
+};
+
+static void *libcrun_krun_child_starter (void *arg);
 /* Branch listener: reads branch requests from a FIFO and calls krun_branch_ctx
    in the same process owning LIVE_VMMS.  Results written to a result file.  */
 
@@ -742,6 +751,19 @@ libcrun_krun_branch_listener (void *arg)
                 {
                   (void) write (rfd, resp, rn2);
                   close (rfd);
+                  /* Spawn detached pthread → fork → child VM in new process */
+                  struct child_starter_args *csa = malloc (sizeof (*csa));
+                  if (csa)
+                    {
+                      csa->child_ctx = child_ctx;
+                      csa->handle = handle;
+                      pthread_t tid2;
+                      pthread_attr_t attr2;
+                      pthread_attr_init (&attr2);
+                      pthread_attr_setdetachstate (&attr2, PTHREAD_CREATE_DETACHED);
+                      pthread_create (&tid2, &attr2, libcrun_krun_child_starter, csa);
+                      pthread_attr_destroy (&attr2);
+                    }
                 }
             }
         }
@@ -770,6 +792,71 @@ libcrun_krun_branch_listener (void *arg)
 
   unlink (fifo_path);
   return NULL;
+}
+
+static void *
+libcrun_krun_child_starter (void *arg)
+{
+  struct child_starter_args *csa = arg;
+  int32_t child_ctx = csa->child_ctx;
+  void *handle = csa->handle;
+  free (csa);
+
+  int32_t (*krun_start)(uint32_t) = dlsym (handle, "krun_start_enter");
+  if (!krun_start)
+    return NULL;
+
+  pid_t pid = fork ();
+  if (pid < 0)
+    {
+      int fd = open ("/tmp/branch_listener_child.trace",
+                     O_WRONLY | O_CREAT | O_APPEND, 0666);
+      if (fd >= 0)
+        { (void) write (fd, "[ch] fork failed\n", 17); close (fd); }
+      return NULL;
+    }
+
+  if (pid > 0)
+    {
+      int fd = open ("/tmp/branch_listener_child.trace",
+                     O_WRONLY | O_CREAT | O_APPEND, 0666);
+      if (fd >= 0)
+        {
+          char buf[256];
+          int n = snprintf (buf, sizeof (buf),
+                            "[ch] child process %d running ctx %d\n",
+                            (int) pid, child_ctx);
+          (void) write (fd, buf, n);
+          close (fd);
+        }
+      return NULL;
+    }
+
+  prctl (PR_SET_NAME, "krun-child");
+  int fd = open ("/tmp/branch_listener_child.trace",
+                 O_WRONLY | O_CREAT | O_APPEND, 0666);
+  if (fd >= 0)
+    {
+      char buf[256];
+      int n = snprintf (buf, sizeof (buf),
+                        "[ch] child pid %d starting ctx %d\n",
+                        (int) getpid (), child_ctx);
+      (void) write (fd, buf, n);
+      close (fd);
+    }
+  int ret = krun_start ((uint32_t) child_ctx);
+  fd = open ("/tmp/branch_listener_child.trace",
+             O_WRONLY | O_CREAT | O_APPEND, 0666);
+  if (fd >= 0)
+    {
+      char buf[256];
+      int n = snprintf (buf, sizeof (buf),
+                        "[ch] child pid %d exited with %d\n",
+                        (int) getpid (), ret);
+      (void) write (fd, buf, n);
+      close (fd);
+    }
+  _exit (ret == 0 ? 0 : 1);
 }
 
 static int

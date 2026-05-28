@@ -369,6 +369,26 @@ libcrun_write_container_status (const char *state_root, const char *id, libcrun_
   if (UNLIKELY (r != json_gen_status_ok))
     goto gen_error;
 
+
+  if (status->handler_name)
+    {
+      r = json_gen_string (gen, "handler_name", strlen ("handler_name"));
+      if (UNLIKELY (r != json_gen_status_ok))
+        goto gen_error;
+
+      r = json_gen_string (gen, status->handler_name, strlen (status->handler_name));
+      if (UNLIKELY (r != json_gen_status_ok))
+        goto gen_error;
+
+      r = json_gen_string (gen, "handler_ctx_id", strlen ("handler_ctx_id"));
+      if (UNLIKELY (r != json_gen_status_ok))
+        goto gen_error;
+
+      r = map_uint (gen, status->handler_ctx_id);
+      if (UNLIKELY (r != json_gen_status_ok))
+        goto gen_error;
+    }
+
   r = json_gen_map_close (gen);
   if (UNLIKELY (r != json_gen_status_ok))
     goto gen_error;
@@ -551,6 +571,15 @@ libcrun_read_container_status (libcrun_container_status_t *status, const char *s
     status->detached = tmp != NULL && json_object_get_boolean (tmp);
   }
   {
+    tmp = json_object_object_get (doc, "handler_name");
+    val = tmp ? json_object_get_string (tmp) : NULL;
+    status->handler_name = val ? xstrdup (val) : NULL;
+  }
+  {
+    tmp = json_object_object_get (doc, "handler_ctx_id");
+    status->handler_ctx_id = tmp ? (uint32_t) json_object_get_int64 (tmp) : 0;
+  }
+  {
     tmp = json_object_object_get (doc, "external_descriptors");
     val = tmp ? json_object_get_string (tmp) : NULL;
     status->external_descriptors = val ? xstrdup (val) : NULL;
@@ -691,6 +720,7 @@ libcrun_free_container_status (libcrun_container_status_t *status)
   free (status->bundle);
   free (status->rootfs);
   free (status->external_descriptors);
+  free (status->handler_name);
   free (status->created);
   free (status->scope);
   free (status->owner);

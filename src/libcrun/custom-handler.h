@@ -49,6 +49,10 @@ struct custom_handler_s
                                    runtime_spec_schema_config_schema *def,
                                    libcrun_error_t *err);
 
+  int (*branch_func) (void *cookie, const char *parent_id,
+                      uint32_t *child_ctx_id,
+                      libcrun_error_t *err);
+
   int (*close_fds) (void *cookie, libcrun_container_t *container,
                     int preserve_fds, libcrun_error_t *err);
 };

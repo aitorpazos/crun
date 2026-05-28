@@ -45,6 +45,7 @@ struct delete_options_s
 {
   int regex;
   bool force;
+  bool recursive;
 };
 
 static struct delete_options_s delete_options;
@@ -52,6 +53,7 @@ static struct delete_options_s delete_options;
 static struct argp_option options[]
     = { { "force", 'f', 0, 0, "delete the container even if it is still running", 0 },
         { "regex", 'r', 0, 0, "the specified CONTAINER is a regular expression (delete multiple containers)", 0 },
+        { "recursive", 'R', 0, 0, "also delete child containers first", 0 },
         {
             0,
         } };
@@ -69,6 +71,10 @@ parse_opt (int key, char *arg arg_unused, struct argp_state *state arg_unused)
 
     case 'r':
       delete_options.regex = true;
+      break;
+
+    case 'R':
+      delete_options.recursive = true;
       break;
 
     case ARGP_KEY_NO_ARGS:
@@ -123,6 +129,82 @@ crun_command_delete (struct crun_global_arguments *global_args, int argc, char *
       libcrun_free_containers_list (list);
       regfree (&re);
       return 0;
+    }
+
+  if (delete_options.recursive)
+    {
+      libcrun_container_list_t *list, *it;
+      const char *target = argv[first_arg];
+      int pass_count = 0;
+
+      ret = libcrun_get_containers_list (&list, crun_context.state_root, err);
+      if (UNLIKELY (ret < 0))
+        libcrun_fail_with_error (0, "cannot read containers list");
+
+      /* Collect all containers into array and read their parents */
+      /* First pass: count entries */
+      int total = 0;
+      for (it = list; it; it = it->next) total++;
+
+      if (total > 0)
+        {
+          char **all_ids = calloc (total, sizeof (char *));
+          char **all_parents = calloc (total, sizeof (char *));
+          int count = 0;
+          for (it = list; it; it = it->next)
+            {
+              libcrun_container_status_t status;
+              all_ids[count] = strdup (it->name);
+              all_parents[count] = NULL;
+              if (libcrun_read_container_status (&status, crun_context.state_root, it->name, err) >= 0)
+                {
+                  all_parents[count] = status.parent ? strdup (status.parent) : NULL;
+                  libcrun_free_container_status (&status);
+                }
+              count++;
+            }
+
+          /* Delete descendants in bottom-up order (multi-pass) */
+          bool any_deleted = true;
+          while (any_deleted)
+            {
+              any_deleted = false;
+              for (int i = 0; i < count; i++)
+                {
+                  if (all_ids[i] == NULL) continue;
+                  /* Is this a descendant whose parent is already deleted? */
+                  if (all_parents[i] \
+                      && (strcmp (all_parents[i], target) == 0 || all_parents[i][0] == '#'))
+                    {
+                      ret = libcrun_container_delete (&crun_context, NULL, all_ids[i], delete_options.force, err);
+                      if (ret == 0)
+                        {
+                          free (all_ids[i]); all_ids[i] = NULL;
+                          free (all_parents[i]); all_parents[i] = strdup ("#");
+                          any_deleted = true;
+                        }
+                    }
+                }
+              pass_count++;
+              if (pass_count > total) break;
+            }
+
+          /* Now delete direct children whose parent matches target */
+          for (int i = 0; i < count; i++)
+            {
+              if (all_ids[i] && all_parents[i] && strcmp (all_parents[i], target) == 0)
+                {
+                  ret = libcrun_container_delete (&crun_context, NULL, all_ids[i], delete_options.force, err);
+                  if (UNLIKELY (ret < 0))
+                    libcrun_error_write_warning_and_release (stderr, &err);
+                }
+              free (all_ids[i]);
+              free (all_parents[i]);
+            }
+          free (all_ids);
+          free (all_parents);
+        }
+      libcrun_free_containers_list (list);
     }
 
   return libcrun_container_delete (&crun_context, NULL, argv[first_arg], delete_options.force, err);

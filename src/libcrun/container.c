@@ -1880,17 +1880,38 @@ container_delete_internal (libcrun_context_t *context, runtime_spec_schema_confi
     {
       ret = read_container_config_from_state (&container, state_root, id, err);
       if (UNLIKELY (ret < 0))
-        return ret;
-
-      def = container->container_def;
+        {
+          if (force)
+            {
+              crun_error_release (err);
+              def = NULL;
+            }
+          else
+            return ret;
+        }
+      else
+        def = container->container_def;
     }
 
   if (killall && force)
     {
+      /* Split-child containers (krun) do not have config.json in their status dir.
+         Kill them directly via status PID without requiring config.  */
+      if (status.handler_name && strcmp (status.handler_name, "krun") == 0)
+        {
+          ret = libcrun_kill_linux (&status, SIGKILL, err);
+          if (UNLIKELY (ret < 0))
+            {
+              errno = crun_error_get_errno (err);
+              if (errno != ESRCH && errno != EINVAL)
+                return ret;
+              crun_error_release (err);
+            }
+        }
       /* If the container has a pid namespace, it is enough to kill the first
          process (pid=1 in the namespace).
       */
-      if (has_new_pid_namespace (def))
+      else if (def && has_new_pid_namespace (def))
         {
           ret = libcrun_kill_linux (&status, SIGKILL, err);
           if (UNLIKELY (ret < 0))
@@ -1913,7 +1934,7 @@ container_delete_internal (libcrun_context_t *context, runtime_spec_schema_confi
         }
     }
 
-  if (def->linux && def->linux->intel_rdt)
+  if (def && def->linux && def->linux->intel_rdt)
     {
       ret = libcrun_destroy_intelrdt (id, def, err);
       if (UNLIKELY (ret < 0))
@@ -1927,9 +1948,12 @@ container_delete_internal (libcrun_context_t *context, runtime_spec_schema_confi
         crun_error_write_warning_and_release (context->output_handler_arg, &err);
     }
 
-  ret = run_poststop_hooks (context, container, def, &status, state_root, id, err);
-  if (UNLIKELY (ret < 0))
-    crun_error_write_warning_and_release (context->output_handler_arg, &err);
+  if (def)
+    {
+      ret = run_poststop_hooks (context, container, def, &status, state_root, id, err);
+      if (UNLIKELY (ret < 0))
+        crun_error_write_warning_and_release (context->output_handler_arg, &err);
+    }
 
   return libcrun_container_delete_status (state_root, id, err);
 }

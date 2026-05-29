@@ -811,6 +811,7 @@ libcrun_krun_child_starter (void *arg)
   void *handle = csa->handle;
 
   int32_t (*krun_start)(uint32_t) = dlsym (handle, "krun_start_enter");
+  int32_t (*krun_resume)(uint32_t) = dlsym (handle, "krun_resume_ctx");
   if (!krun_start)
     {
       free (csa);
@@ -876,29 +877,19 @@ libcrun_krun_child_starter (void *arg)
                 _exit (0);
               }
 
-            /* Grandchild: no PDEATHSIG, new PID ns.  */
-            prctl (PR_SET_NAME, "krun-child");
+            /* Grandchild: resume paused vCPUs, then start VM */
+            if (krun_resume)
+              krun_resume ((uint32_t) child_ctx);
             int ret = krun_start ((uint32_t) child_ctx);
             _exit (ret == 0 ? 0 : 1);
           }
       }
 
-    /* Normal path: PDEATHSIG kills child when parent exits.  */
-    prctl (PR_SET_PDEATHSIG, SIGKILL);
-    prctl (PR_SET_NAME, "krun-child");
-    int fd = open ("/tmp/branch_listener_child.trace",
-                   O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd >= 0)
-      {
-        char buf[256];
-        int n = snprintf (buf, sizeof (buf),
-                          "[ch] child pid %d starting ctx %d\n",
-                          (int) getpid (), child_ctx);
-        (void) write (fd, buf, n);
-        close (fd);
-      }
+    /* Normal path: resume paused vCPUs, then start VM */
+    if (krun_resume)
+      krun_resume ((uint32_t) child_ctx);
     int ret = krun_start ((uint32_t) child_ctx);
-    fd = open ("/tmp/branch_listener_child.trace",
+    int fd = open ("/tmp/branch_listener_child.trace",
                O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0)
       {

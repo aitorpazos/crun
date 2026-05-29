@@ -74,6 +74,11 @@
 #define KRUN_FLAVOR_AWS_NITRO "aws-nitro"
 #define KRUN_FLAVOR_SEV "sev"
 
+/* libkrun headers before the net-features rename may not export this.  */
+#ifndef COMPAT_NET_FEATURES
+# define COMPAT_NET_FEATURES (1U) | (1U << 1) | (1U << 7) | (1U << 10) | (1U << 11) | (1U << 14)
+#endif
+
 #define PASST_FD_PARENT 0
 #define PASST_FD_CHILD 1
 
@@ -903,6 +908,65 @@ libcrun_krun_branch_listener (void *arg)
   return NULL;
 }
 
+static int
+start_child_passt (void *handle, uint32_t child_ctx)
+{
+  int32_t (*krun_add_net_unixstream)(uint32_t, const char *, int,
+                                     uint8_t *const, uint32_t, uint32_t);
+  int passt_fds[2];
+  char fd_str[16];
+  pid_t passt_pid;
+  int status;
+  int null;
+
+  krun_add_net_unixstream = dlsym (handle, "krun_add_net_unixstream");
+  if (! krun_add_net_unixstream)
+    return -1;
+
+  if (socketpair (AF_UNIX, SOCK_STREAM, 0, passt_fds) < 0)
+    return -1;
+
+  snprintf (fd_str, sizeof (fd_str), "%d", passt_fds[PASST_FD_CHILD]);
+
+  passt_pid = fork ();
+  if (passt_pid < 0)
+    return -1;
+
+  if (passt_pid == 0)
+    {
+      close (passt_fds[PASST_FD_PARENT]);
+      null = open ("/dev/null", O_WRONLY);
+      if (null >= 0)
+        {
+          dup2 (null, STDOUT_FILENO);
+          dup2 (null, STDERR_FILENO);
+          close (null);
+        }
+      execlp ("passt", "passt", "-t", "all", "-u", "all",
+              "--no-dhcp-dns", "--fd", fd_str, NULL);
+      _exit (EXIT_FAILURE);
+    }
+
+  close (passt_fds[PASST_FD_CHILD]);
+
+  if (waitpid (passt_pid, &status, 0) < 0)
+    return -1;
+  if (! (WIFEXITED (status) && WEXITSTATUS (status) == 0))
+    return -1;
+
+  /* Derive a unique MAC from the child_ctx to avoid collisions with parent.  */
+  uint8_t mac[] = { 0x5a, 0x94, 0xef, 0xe4,
+                    (uint8_t)(child_ctx >> 8),
+                    (uint8_t)(child_ctx & 0xff) };
+
+  if (krun_add_net_unixstream (child_ctx, NULL,
+                               passt_fds[PASST_FD_PARENT],
+                               mac, COMPAT_NET_FEATURES, 0) < 0)
+    return -1;
+
+  return 0;
+}
+
 static void *
 libcrun_krun_child_starter (void *arg)
 {
@@ -978,6 +1042,7 @@ libcrun_krun_child_starter (void *arg)
               }
 
             /* Grandchild: resume paused vCPUs, then start VM */
+            (void) start_child_passt (handle, (uint32_t) child_ctx);
             if (krun_resume)
               krun_resume ((uint32_t) child_ctx);
             int ret = krun_start ((uint32_t) child_ctx);
@@ -986,6 +1051,7 @@ libcrun_krun_child_starter (void *arg)
       }
 
     /* Normal path: resume paused vCPUs, then start VM */
+    (void) start_child_passt (handle, (uint32_t) child_ctx);
     if (krun_resume)
       krun_resume ((uint32_t) child_ctx);
     int ret = krun_start ((uint32_t) child_ctx);

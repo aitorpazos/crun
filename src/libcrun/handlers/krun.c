@@ -639,6 +639,22 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
       }
   }
 
+  /* Write a sidecar so state-file creation can use the real VM PID.  */
+  {
+    cleanup_free char *path = NULL;
+    if (asprintf (&path, "/tmp/krun.vm_pid.%s", kconf->container_id) >= 0)
+      {
+        int vm_fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (vm_fd >= 0)
+          {
+            char buf[32];
+            int n = snprintf (buf, sizeof (buf), "%d\n", (int) getpid ());
+            (void) write (vm_fd, buf, n);
+            close (vm_fd);
+          }
+      }
+  }
+
   /* Spawn a FIFO listener in the VM process so krun_branch_ctx accesses
      the same process-local LIVE_VMMS map.  */
   {
@@ -651,11 +667,38 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
       pthread_detach (bl_tid);
   }
 
+  /* Fork so the parent can return immediately with the VM running
+     as a child process, allowing `crun create` to record a real PID.  */
+  pid_t vm_pid = fork ();
+  if (vm_pid < 0)
+    error (EXIT_FAILURE, errno, "could not fork krun VM");
+  if (vm_pid > 0)
+    {
+      /* Parent: record the child PID and wait for it to keep the init
+         process alive.  vm_pid is the real VM process seen by split.c.  */
+      cleanup_free char *path = NULL;
+      if (asprintf (&path, "/tmp/krun.vm_pid.%s", kconf->container_id) >= 0)
+        {
+          int vm_fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+          if (vm_fd >= 0)
+            {
+              char buf[32];
+              int n = snprintf (buf, sizeof (buf), "%d\n", (int) vm_pid);
+              (void) write (vm_fd, buf, n);
+              close (vm_fd);
+            }
+        }
+      int wstatus;
+      (void) waitpid (vm_pid, &wstatus, 0);
+      _exit (WIFEXITED (wstatus) ? WEXITSTATUS (wstatus) : 1);
+    }
+
+  /* vm_pid == 0: child process continues to run the VM.  */
   ret = krun_start_enter (ctx_id);
   if (UNLIKELY (ret < 0))
     error (EXIT_FAILURE, -ret, "could not start krun");
 
-  return ret;
+  _exit (ret == 0 ? 0 : 1);
 }
 
 struct child_starter_args

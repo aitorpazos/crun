@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <sys/resource.h>
 #include "../status.h"
 #include <sys/param.h>
 #include <sys/types.h>
@@ -440,6 +441,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
   int32_t (*krun_set_console_output) (uint32_t ctx_id, const char *c_filepath);
   int32_t (*krun_set_exec) (uint32_t ctx_id, const char *exec_path,
                             const char *const argv[], const char *const envp[]);
+  int32_t (*krun_set_rlimits) (uint32_t ctx_id, const char *const rlimits[]);
   struct krun_config *kconf = (struct krun_config *) cookie;
   void *handle;
   int32_t ctx_id, ret;
@@ -477,6 +479,61 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
     default:
       krun_set_log_level (KRUN_LOG_LEVEL_ERROR);
       break;
+    }
+
+  /* Propagate OCI rlimits into libkrun VM.  */
+  if (def->process->rlimits_len > 0)
+    {
+      krun_set_rlimits = dlsym (handle, "krun_set_rlimits");
+      if (krun_set_rlimits != NULL)
+        {
+          const char **rlimit_strs = calloc (def->process->rlimits_len + 1, sizeof (char *));
+          if (rlimit_strs != NULL)
+            {
+              for (size_t i = 0; i < (size_t) def->process->rlimits_len; i++)
+                {
+                  int resource = -1;
+                  const char *type = def->process->rlimits[i]->type;
+                  if (strcmp (type, "RLIMIT_AS") == 0)          resource = RLIMIT_AS;
+                  else if (strcmp (type, "RLIMIT_CORE") == 0)   resource = RLIMIT_CORE;
+                  else if (strcmp (type, "RLIMIT_CPU") == 0)    resource = RLIMIT_CPU;
+                  else if (strcmp (type, "RLIMIT_DATA") == 0)   resource = RLIMIT_DATA;
+                  else if (strcmp (type, "RLIMIT_FSIZE") == 0)  resource = RLIMIT_FSIZE;
+                  else if (strcmp (type, "RLIMIT_LOCKS") == 0)  resource = RLIMIT_LOCKS;
+                  else if (strcmp (type, "RLIMIT_MEMLOCK") == 0) resource = RLIMIT_MEMLOCK;
+                  else if (strcmp (type, "RLIMIT_MSGQUEUE") == 0) resource = RLIMIT_MSGQUEUE;
+                  else if (strcmp (type, "RLIMIT_NICE") == 0)   resource = RLIMIT_NICE;
+                  else if (strcmp (type, "RLIMIT_NOFILE") == 0) resource = RLIMIT_NOFILE;
+                  else if (strcmp (type, "RLIMIT_NPROC") == 0)  resource = RLIMIT_NPROC;
+                  else if (strcmp (type, "RLIMIT_RSS") == 0)    resource = RLIMIT_RSS;
+                  else if (strcmp (type, "RLIMIT_RTPRIO") == 0) resource = RLIMIT_RTPRIO;
+                  else if (strcmp (type, "RLIMIT_RTTIME") == 0) resource = RLIMIT_RTTIME;
+                  else if (strcmp (type, "RLIMIT_SIGPENDING") == 0) resource = RLIMIT_SIGPENDING;
+                  else if (strcmp (type, "RLIMIT_STACK") == 0)  resource = RLIMIT_STACK;
+
+                  if (resource < 0)
+                    {
+                      error (0, 0, "unsupported rlimit type `%s` for libkrun VM", type);
+                      continue;
+                    }
+                  if (asprintf ((char **) &rlimit_strs[i], "%d=%llu:%llu",
+                                resource,
+                                (unsigned long long) def->process->rlimits[i]->soft,
+                                (unsigned long long) def->process->rlimits[i]->hard) < 0)
+                    {
+                      free (rlimit_strs);
+                      error (EXIT_FAILURE, errno, "asprintf failed");
+                    }
+                }
+              rlimit_strs[def->process->rlimits_len] = NULL;
+              ret = krun_set_rlimits (ctx_id, rlimit_strs);
+              if (UNLIKELY (ret < 0))
+                error (EXIT_FAILURE, -ret, "could not set krun rlimits");
+              for (size_t i = 0; i < (size_t) def->process->rlimits_len; i++)
+                free ((char *) rlimit_strs[i]);
+              free (rlimit_strs);
+            }
+        }
     }
 
   if (kconf->sev)

@@ -28,6 +28,7 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -171,7 +172,28 @@ setup_overlayfs_rootfs (const char *parent_rootfs, const char *overlay_rootfs, c
     OOM ();
 
   ret = mount ("overlay", overlay_rootfs, "overlay", MS_NOATIME, opts);
-  if (UNLIKELY (ret < 0))
+  if (ret < 0 && errno == EPERM)
+    {
+      /* EPERM: unprivileged user — try fuse-overlayfs as fallback.  */
+      pid_t fuse_pid = fork ();
+      if (fuse_pid < 0)
+        return crun_make_error (err, errno, "fork for fuse-overlayfs");
+
+      if (fuse_pid == 0)
+        {
+          execlp ("fuse-overlayfs", "fuse-overlayfs",
+                  "-o", opts, overlay_rootfs, NULL);
+          _exit (EXIT_FAILURE);
+        }
+
+      int wstatus;
+      ret = waitpid (fuse_pid, &wstatus, 0);
+      if (ret < 0)
+        return crun_make_error (err, errno, "fuse-overlayfs failed");
+      if (! (WIFEXITED (wstatus) && WEXITSTATUS (wstatus) == 0))
+        return crun_make_error (err, 0, "fuse-overlayfs exited with error %d", WEXITSTATUS (wstatus));
+    }
+  else if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "mount overlayfs for split container at `%s`", overlay_rootfs);
 
   return 0;

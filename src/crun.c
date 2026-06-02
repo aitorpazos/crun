@@ -179,7 +179,7 @@ struct commands_s commands[] = { { COMMAND_CREATE, "create", crun_command_create
 #endif
                                  { COMMAND_MOUNTS, "mounts", crun_command_mounts },
                                  { COMMAND_SPLIT, "split", crun_command_split },
-#ifdef HAVE_LIBKRUN
+#if HAVE_DLOPEN
                                  { COMMAND_SNAP, "snap", crun_command_snap },
                                  { COMMAND_RESTORE_SNAP, "restore-snap", crun_command_restore_snap },
 #endif
@@ -205,7 +205,7 @@ static char doc[] = "\nCOMMANDS:\n"
 #endif
                     "\trun         - run a container\n"
                     "\tsplit       - split a container from a parent with COW overlayfs\n"
-#ifdef HAVE_LIBKRUN
+#if HAVE_DLOPEN
                     "\tsnap        - create a libkrun VM snapshot\n"
                     "\trestore-snap - restore a libkrun VM from snapshot\n"
 #endif

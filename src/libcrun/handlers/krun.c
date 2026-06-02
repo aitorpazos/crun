@@ -79,8 +79,12 @@
 # define COMPAT_NET_FEATURES (1U) | (1U << 1) | (1U << 7) | (1U << 10) | (1U << 11) | (1U << 14)
 #endif
 
-#define PASST_FD_PARENT 0
-#define PASST_FD_CHILD 1
+#define NET_FLAG_VFKIT (1 << 0)
+#ifndef NET_FLAG_DHCP_CLIENT
+#define NET_FLAG_DHCP_CLIENT (1U << 1)
+#endif
+
+#define GVPROXY_SOCKET "/shared-net/gvproxy.sock"
 
 struct krun_config
 {
@@ -94,11 +98,11 @@ struct krun_config
   int32_t ctx_id_awsnitro;
   bool has_kvm;
   bool has_awsnitro;
-  int passt_fds[2];
   json_object *config_doc;
   json_object *config_tree;
-  bool use_passt;
   char container_id[128];
+  int use_gvproxy;
+  int net_fd;
 };
 
 /* libkrun handler.  */
@@ -324,14 +328,81 @@ libkrun_configure_vm (uint32_t ctx_id, void *handle, struct krun_config *kconf, 
         return crun_make_error (err, -ret, "could not enable nested virtualization");
     }
 
-  if (kconf->use_passt)
+  int use_gvproxy = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.use_gvproxy", "use_gvproxy");
+  int use_passt = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.use_passt", "use_passt");
+  kconf->use_gvproxy = use_gvproxy;
+
+  if (use_gvproxy > 0)
     {
+      int32_t (*krun_add_net_unixgram) (uint32_t, const char *, int,
+                                          uint8_t *, uint32_t, uint32_t);
+      krun_add_net_unixgram = dlsym (handle, "krun_add_net_unixgram");
+      if (krun_add_net_unixgram)
+        {
+          uint8_t mac[] = { 0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee };
+          ret = krun_add_net_unixgram (ctx_id, GVPROXY_SOCKET,
+                                       -1, &mac[0], COMPAT_NET_FEATURES,
+                                       NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT);
+          if (UNLIKELY (ret < 0))
+            error (EXIT_FAILURE, -ret, "could not set krun gvproxy net configuration");
+        }
+    }
+  else if (use_passt > 0)
+    {
+      int passt_fds[2];
+
       krun_add_net_unixstream = dlsym (handle, "krun_add_net_unixstream");
 
+      if (socketpair (AF_UNIX, SOCK_STREAM, 0, passt_fds) < 0)
+        return crun_make_error (err, errno, "could not create passt socketpair");
+
+      {
+        pid_t pid;
+        char *passt_argv[9];
+        char fd_as_str[8];
+        int argv_idx = 0;
+        int status, null;
+
+        snprintf (fd_as_str, sizeof (fd_as_str), "%d", passt_fds[1]);
+        passt_argv[argv_idx++] = (char *) "passt";
+        passt_argv[argv_idx++] = (char *) "-t";
+        passt_argv[argv_idx++] = (char *) "all";
+        if (! kconf->has_awsnitro)
+          {
+            passt_argv[argv_idx++] = (char *) "-u";
+            passt_argv[argv_idx++] = (char *) "all";
+          }
+        passt_argv[argv_idx++] = (char *) "--fd";
+        passt_argv[argv_idx++] = fd_as_str;
+        passt_argv[argv_idx] = NULL;
+
+        pid = fork ();
+        if (pid < 0)
+          return crun_make_error (err, errno, "fork() for passt failed");
+        if (pid == 0)
+          {
+            close (passt_fds[0]);
+            null = open ("/dev/null", O_WRONLY);
+            if (null == -1)
+              _exit (EXIT_FAILURE);
+            dup2 (null, STDOUT_FILENO);
+            dup2 (null, STDERR_FILENO);
+            close (null);
+            execvp ("passt", passt_argv);
+            _exit (EXIT_FAILURE);
+          }
+        close (passt_fds[1]);
+        waitpid (pid, &status, 0);
+        if (! (WIFEXITED (status) && WEXITSTATUS (status) == 0))
+          return crun_make_error (err, 0, "passt failed to daemonize");
+      }
+
       uint8_t mac[] = { 0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee };
-      ret = krun_add_net_unixstream (ctx_id, NULL, kconf->passt_fds[PASST_FD_PARENT], &mac[0], COMPAT_NET_FEATURES, 0);
+      ret = krun_add_net_unixstream (ctx_id, NULL, passt_fds[0],
+                                     &mac[0], COMPAT_NET_FEATURES, NET_FLAG_DHCP_CLIENT);
       if (UNLIKELY (ret < 0))
         error (EXIT_FAILURE, -ret, "could not set krun net configuration");
+      kconf->net_fd = passt_fds[0];
     }
 
   if (kconf->config_tree != NULL)
@@ -431,6 +502,7 @@ struct branch_listener_info
 {
   void *handle;
   char container_id[128];
+  int use_gvproxy;
 };
 static void *libcrun_krun_branch_listener (void *arg);
 
@@ -667,6 +739,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
     blinfo.handle = handle;
     strncpy (blinfo.container_id, kconf->container_id, sizeof (blinfo.container_id) - 1);
     blinfo.container_id[sizeof (blinfo.container_id) - 1] = '\0';
+    blinfo.use_gvproxy = kconf->use_gvproxy;
     pthread_t bl_tid;
     if (pthread_create (&bl_tid, NULL, libcrun_krun_branch_listener, &blinfo) == 0)
       pthread_detach (bl_tid);
@@ -712,6 +785,7 @@ struct child_starter_args
   void *handle;
   char state_root[256];
   char container_id[128];
+  int use_gvproxy;
 };
 
 static void *libcrun_krun_child_starter (void *arg);
@@ -723,6 +797,7 @@ libcrun_krun_branch_listener (void *arg)
 {
   struct branch_listener_info *info = (struct branch_listener_info *) arg;
   void *handle = info->handle;
+  int use_gvproxy = info->use_gvproxy;
   char container_id[128];
   strncpy (container_id, info->container_id, sizeof (container_id) - 1);
   container_id[sizeof (container_id) - 1] = '\0';
@@ -871,6 +946,7 @@ libcrun_krun_branch_listener (void *arg)
                       csa->handle = handle;
                       snprintf (csa->state_root, sizeof(csa->state_root), "%s", state_root);
                       snprintf (csa->container_id, sizeof(csa->container_id), "%s", child_id);
+                      csa->use_gvproxy = use_gvproxy;
                       pthread_t tid2;
                       pthread_attr_t attr2;
                       pthread_attr_init (&attr2);
@@ -909,60 +985,85 @@ libcrun_krun_branch_listener (void *arg)
 }
 
 static int
-start_child_passt (void *handle, uint32_t child_ctx)
+start_child_net (void *handle, uint32_t child_ctx, int is_gvproxy)
 {
   int32_t (*krun_add_net_unixstream)(uint32_t, const char *, int,
                                      uint8_t *const, uint32_t, uint32_t);
-  int passt_fds[2];
-  char fd_str[16];
-  pid_t passt_pid;
-  int status;
-  int null;
-
-  krun_add_net_unixstream = dlsym (handle, "krun_add_net_unixstream");
-  if (! krun_add_net_unixstream)
-    return -1;
-
-  if (socketpair (AF_UNIX, SOCK_STREAM, 0, passt_fds) < 0)
-    return -1;
-
-  snprintf (fd_str, sizeof (fd_str), "%d", passt_fds[PASST_FD_CHILD]);
-
-  passt_pid = fork ();
-  if (passt_pid < 0)
-    return -1;
-
-  if (passt_pid == 0)
-    {
-      close (passt_fds[PASST_FD_PARENT]);
-      null = open ("/dev/null", O_WRONLY);
-      if (null >= 0)
-        {
-          dup2 (null, STDOUT_FILENO);
-          dup2 (null, STDERR_FILENO);
-          close (null);
-        }
-      execlp ("passt", "passt", "-t", "all", "-u", "all",
-              "--no-dhcp-dns", "--fd", fd_str, NULL);
-      _exit (EXIT_FAILURE);
-    }
-
-  close (passt_fds[PASST_FD_CHILD]);
-
-  if (waitpid (passt_pid, &status, 0) < 0)
-    return -1;
-  if (! (WIFEXITED (status) && WEXITSTATUS (status) == 0))
-    return -1;
+  int32_t (*krun_add_net_unixgram)(uint32_t, const char *, int,
+                                   uint8_t *const, uint32_t, uint32_t);
 
   /* Derive a unique MAC from the child_ctx to avoid collisions with parent.  */
   uint8_t mac[] = { 0x5a, 0x94, 0xef, 0xe4,
                     (uint8_t)(child_ctx >> 8),
                     (uint8_t)(child_ctx & 0xff) };
 
-  if (krun_add_net_unixstream (child_ctx, NULL,
-                               passt_fds[PASST_FD_PARENT],
-                               mac, COMPAT_NET_FEATURES, 0) < 0)
-    return -1;
+  if (is_gvproxy)
+    {
+      krun_add_net_unixgram = dlsym (handle, "krun_add_net_unixgram");
+      if (! krun_add_net_unixgram)
+        return -1;
+
+      cleanup_free char *child_sock = NULL;
+      if (asprintf (&child_sock, "/tmp/gvproxy-%u.sock",
+                    (uint32_t) child_ctx) < 0)
+        return -1;
+
+      int ret = krun_add_net_unixgram (child_ctx, child_sock, -1,
+                                       mac, COMPAT_NET_FEATURES,
+                                       NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT);
+      if (ret < 0)
+        return -1;
+      return 0;
+    }
+
+  /* passt fallback */
+  {
+    int passt_fds[2];
+    char fd_str[16];
+    pid_t passt_pid;
+    int status;
+    int null;
+
+    krun_add_net_unixstream = dlsym (handle, "krun_add_net_unixstream");
+    if (! krun_add_net_unixstream)
+      return -1;
+
+    if (socketpair (AF_UNIX, SOCK_STREAM, 0, passt_fds) < 0)
+      return -1;
+
+    snprintf (fd_str, sizeof (fd_str), "%d", passt_fds[1]);
+
+    passt_pid = fork ();
+    if (passt_pid < 0)
+      return -1;
+
+    if (passt_pid == 0)
+      {
+        close (passt_fds[0]);
+        null = open ("/dev/null", O_WRONLY);
+        if (null >= 0)
+          {
+            dup2 (null, STDOUT_FILENO);
+            dup2 (null, STDERR_FILENO);
+            close (null);
+          }
+        execlp ("passt", "passt", "-t", "all", "-u", "all",
+                "--fd", fd_str, NULL);
+        _exit (EXIT_FAILURE);
+      }
+
+    close (passt_fds[1]);
+
+    if (waitpid (passt_pid, &status, 0) < 0)
+      return -1;
+    if (! (WIFEXITED (status) && WEXITSTATUS (status) == 0))
+      return -1;
+
+    if (krun_add_net_unixstream (child_ctx, NULL,
+                                 passt_fds[0],
+                                 mac, COMPAT_NET_FEATURES, 0) < 0)
+      return -1;
+  }
 
   return 0;
 }
@@ -973,6 +1074,7 @@ libcrun_krun_child_starter (void *arg)
   struct child_starter_args *csa = arg;
   int32_t child_ctx = csa->child_ctx;
   void *handle = csa->handle;
+  int use_gvproxy = csa->use_gvproxy;
 
   int32_t (*krun_start)(uint32_t) = dlsym (handle, "krun_start_enter");
   int32_t (*krun_resume)(uint32_t) = dlsym (handle, "krun_resume_ctx");
@@ -1042,7 +1144,7 @@ libcrun_krun_child_starter (void *arg)
               }
 
             /* Grandchild: resume paused vCPUs, then start VM */
-            (void) start_child_passt (handle, (uint32_t) child_ctx);
+            (void) start_child_net (handle, (uint32_t) child_ctx, use_gvproxy);
             if (krun_resume)
               krun_resume ((uint32_t) child_ctx);
             int ret = krun_start ((uint32_t) child_ctx);
@@ -1051,7 +1153,7 @@ libcrun_krun_child_starter (void *arg)
       }
 
     /* Normal path: resume paused vCPUs, then start VM */
-    (void) start_child_passt (handle, (uint32_t) child_ctx);
+    (void) start_child_net (handle, (uint32_t) child_ctx, use_gvproxy);
     if (krun_resume)
       krun_resume ((uint32_t) child_ctx);
     int ret = krun_start ((uint32_t) child_ctx);
@@ -1070,75 +1172,15 @@ libcrun_krun_child_starter (void *arg)
   }
 }
 
+/* Forward declaration needed by child starter */
+static int start_child_net (void *handle, uint32_t child_ctx, int is_gvproxy);
+
 static int
 libkrun_start_passt (void *cookie, libcrun_container_t *container)
 {
-  struct krun_config *kconf = (struct krun_config *) cookie;
-  pid_t pid;
-  char *passt_argv[9];
-  char fd_as_str[16];
-  int use_passt;
-  int argv_idx;
-  int status;
-  int null;
-  int ret;
-
-  use_passt = libkrun_parse_resource_configuration (kconf->config_tree, container, "krun.use_passt", "use_passt");
-  if (use_passt > 0)
-    kconf->use_passt = 1;
-  else
-    return 0;
-
-  ret = socketpair (AF_UNIX, SOCK_STREAM, 0, kconf->passt_fds);
-  if (UNLIKELY (ret < 0))
-    return ret;
-  snprintf (fd_as_str, sizeof (fd_as_str), "%d", kconf->passt_fds[PASST_FD_CHILD]);
-
-  argv_idx = 0;
-  passt_argv[argv_idx++] = (char *) "passt";
-  passt_argv[argv_idx++] = (char *) "-t";
-  passt_argv[argv_idx++] = (char *) "all";
-
-  if (! kconf->has_awsnitro)
-    {
-      passt_argv[argv_idx++] = (char *) "-u";
-      passt_argv[argv_idx++] = (char *) "all";
-      passt_argv[argv_idx++] = (char *) "--no-dhcp-dns";
-    }
-
-  passt_argv[argv_idx++] = (char *) "--fd";
-  passt_argv[argv_idx++] = fd_as_str;
-  passt_argv[argv_idx] = NULL;
-
-  pid = fork ();
-  if (pid < 0)
-    return pid;
-  else if (pid == 0)
-    {
-      close (kconf->passt_fds[PASST_FD_PARENT]);
-
-      null = open ("/dev/null", O_WRONLY);
-      if (null == -1)
-        _exit (EXIT_FAILURE);
-
-      // Redirect passt's stdout and stderr to /dev/null, as closing them here
-      // instead will cause passt to exit with an error.
-      dup2 (null, STDOUT_FILENO);
-      dup2 (null, STDERR_FILENO);
-      close (null);
-
-      execvp ("passt", passt_argv);
-      // Only reachable on error.
-      _exit (EXIT_FAILURE);
-    }
-
-  close (kconf->passt_fds[PASST_FD_CHILD]);
-
-  // Wait for passt to daemonize itself.
-  waitpid (pid, &status, 0);
-  if (! (WIFEXITED (status)) || WEXITSTATUS (status) != 0)
-    return -1;
-
+  /* Passt/gvproxy startup is now handled in libkrun_configure_vm.  */
+  (void) cookie;
+  (void) container;
   return 0;
 }
 
@@ -1212,7 +1254,8 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
   if (phase != HANDLER_CONFIGURE_AFTER_MOUNTS)
     return 0;
 
-  ret = libkrun_start_passt (cookie, container);
+  ret = 0;
+  /* passt/gvproxy startup is inlined into libkrun_configure_vm */
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "start passt");
 
@@ -1492,24 +1535,22 @@ libkrun_close_fds (void *cookie, libcrun_container_t *container, int preserve_fd
 {
   struct krun_config *kconf = (struct krun_config *) cookie;
   int first_fd_to_close = preserve_fds + 3;
-  int passt_fd;
   int i;
+  int net_fd = kconf->net_fd;
 
-  if (kconf->use_passt)
+  /* If passt is used, kconf->net_fd is the socketpair fd that libkrun needs
+     for the virtio-net device.  It must stay open in the VM process.  */
+  if (net_fd > 0)
     {
-      passt_fd = kconf->passt_fds[PASST_FD_PARENT];
-
-      if (first_fd_to_close <= passt_fd)
+      if (first_fd_to_close <= net_fd)
         {
-          for (i = first_fd_to_close; i < passt_fd; i++)
+          for (i = first_fd_to_close; i < net_fd; i++)
             {
-              // If we're closing proc_fd, make sure to invalidate it.
               if (i == container->proc_fd)
                 container->proc_fd = -1;
               close (i);
             }
-
-          first_fd_to_close = passt_fd + 1;
+          first_fd_to_close = net_fd + 1;
         }
     }
 

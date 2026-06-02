@@ -67,33 +67,44 @@ static struct argp run_argp = { options, parse_opt, args_doc, doc, NULL, NULL, N
 
 typedef int32_t (*krun_restore_fn) (int fd, uint32_t flags);
 
+typedef int32_t (*krun_start_fn) (uint32_t ctx_id);
+
 static int
-dlopen_krun_and_restore (int fd, libcrun_error_t *err)
+dlopen_krun_restore_and_start (int fd, libcrun_error_t *err)
 {
   void *handle;
   krun_restore_fn krun_restore;
-  int32_t ret;
+  krun_start_fn krun_start_enter;
+  int32_t ctx_id, ret;
 
   handle = dlopen ("libkrun.so", RTLD_LAZY);
   if (handle == NULL)
     return crun_make_error (err, 0, "dlopen libkrun.so: %s", dlerror ());
 
   krun_restore = (krun_restore_fn) dlsym (handle, "krun_restore_vm");
-  if (krun_restore == NULL)
+  krun_start_enter = (krun_start_fn) dlsym (handle, "krun_start_enter");
+  if (krun_restore == NULL || krun_start_enter == NULL)
     {
       dlclose (handle);
-      return crun_make_error (err, 0, "libkrun missing krun_restore_vm symbol");
+      return crun_make_error (err, 0,
+                              "libkrun missing symbols: restore=%s start=%s",
+                              krun_restore ? "ok" : "MISSING",
+                              krun_start_enter ? "ok" : "MISSING");
     }
 
-  ret = krun_restore (fd, 0);
-  if (ret < 0)
+  ctx_id = krun_restore (fd, 0);
+  if (ctx_id < 0)
     {
       dlclose (handle);
-      return crun_make_error (err, -ret, "krun_restore_vm(fd=%d) failed", fd);
+      return crun_make_error (err, -ctx_id, "krun_restore_vm(fd=%d) failed", fd);
     }
 
+  fprintf (stderr, "restored snapshot into ctx_id=%d, now entering VM...\n", ctx_id);
+
+  ret = krun_start_enter ((uint32_t) ctx_id);
+  // krun_start_enter does not return on success
   dlclose (handle);
-  return ret;
+  return crun_make_error (err, -ret, "krun_start_enter failed");
 }
 
 int
@@ -125,12 +136,10 @@ crun_command_restore_snap (struct crun_global_arguments *global_args, int argc,
     return crun_make_error (err, errno, "open `%s` for restore",
                             restore_snap_options.image_path);
 
-  ret = dlopen_krun_and_restore (fd, err);
+  ret = dlopen_krun_restore_and_start (fd, err);
   close (fd);
 
-  if (LIKELY (ret == 0))
-    printf ("Restored from %s (new ctx_id=%d)\n",
-            restore_snap_options.image_path, (int) ret);
+  
 
   return ret;
 }

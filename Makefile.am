@@ -149,7 +149,7 @@ crun_CFLAGS += $(COVERAGE_CFLAGS)
 endif
 crun_SOURCES = src/crun.c src/run.c src/delete.c src/kill.c src/pause.c src/unpause.c src/oci_features.c src/spec.c \
 		src/exec.c src/list.c src/create.c src/start.c src/state.c src/update.c src/ps.c \
-		src/checkpoint.c src/restore.c src/mounts.c src/run_create.c src/split.c src/fork.c
+		src/checkpoint.c src/restore.c src/mounts.c src/run_create.c src/split.c src/snap.c src/restore-snap.c src/fork.c
 
 if DYNLOAD_LIBCRUN
 if ENABLE_COVERAGE

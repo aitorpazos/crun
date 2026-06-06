@@ -32,6 +32,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <json-c/json.h>
 
@@ -657,30 +658,52 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                 break;
               usleep (100000);
             }
+          cleanup_free char *response_fifo_guest = NULL;
+          cleanup_free char *response_fifo_proc = NULL;
+          cleanup_close int response_fd = -1;
+          if (asprintf (&response_fifo_guest, "/tmp/krun.branch.response.%s.fifo", child_id) >= 0
+              && asprintf (&response_fifo_proc, "/proc/%d/root%s", (int) parent_pid, response_fifo_guest) >= 0)
+            {
+              (void) unlink (response_fifo_proc);
+              if (mkfifo (response_fifo_proc, 0666) == 0)
+                response_fd = open (response_fifo_proc, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+            }
+
+          if (no_cleanup)
+            {
+              cleanup_free char *npath = NULL;
+              if (asprintf (&npath, "/proc/%d/root/tmp/krun.branch.nocleanup.%s",
+                            (int) parent_pid, child_id) > 0)
+                {
+                  int nfd = open (npath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                  if (nfd >= 0)
+                    close (nfd);
+                }
+            }
+
           int fd = open (fifo_path, O_WRONLY);
           if (fd >= 0)
             {
               /* Remove O_NONBLOCK so write blocks until reader opens.  */
               fcntl (fd, F_SETFL, fcntl (fd, F_GETFL) & ~O_NONBLOCK);
               cleanup_free char *req = NULL;
-              int reqn = asprintf (&req, "%s\n%s\n", child_id, child_state_dir);
+              int reqn = asprintf (&req, "%s\n%s\n%s\n", child_id, child_state_dir,
+                                   response_fd >= 0 ? response_fifo_guest : "");
               if (reqn > 0)
                 {
                   (void) write (fd, req, reqn);
                   close (fd);
 
-                  /* Read result from the container's tmpfs via proc.  */
-                  /* Create nocleanup sentinel if requested */
-                  if (no_cleanup)
+                  /* Read result synchronously from a per-request response FIFO when available.
+                     Older listeners ignore the third line, so retain the sidecar file fallback.  */
+                  char fifo_resp[128] = {0};
+                  int fifo_rn = -1;
+                  if (response_fd >= 0)
                     {
-                      cleanup_free char *npath = NULL;
-                      if (asprintf (&npath, "/proc/%d/root/tmp/krun.branch.nocleanup.%s",
-                                    (int) parent_pid, child_id) > 0)
-                        {
-                          int nfd = open (npath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                          if (nfd >= 0)
-                            close (nfd);
-                        }
+                      struct pollfd pfd = { .fd = response_fd, .events = POLLIN };
+                      if (poll (&pfd, 1, 5000) > 0 && (pfd.revents & POLLIN))
+                        fifo_rn = read (response_fd, fifo_resp, sizeof (fifo_resp) - 1);
+                      (void) unlink (response_fifo_proc);
                     }
 
                   cleanup_free char *rr_path = NULL;
@@ -688,18 +711,23 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                                 (int) parent_pid, child_id) >= 0)
                     {
                       char resp[128] = {0};
-                      int rn = -1;
-                      for (int tries = 0; tries < 5000; tries++)
+                      int rn = fifo_rn;
+                      if (fifo_rn > 0)
+                        memcpy (resp, fifo_resp, sizeof (resp));
+                      else
                         {
-                          int rfd = open (rr_path, O_RDONLY | O_NONBLOCK);
-                          if (rfd >= 0)
+                          for (int tries = 0; tries < 5000; tries++)
                             {
-                              rn = read (rfd, resp, sizeof (resp) - 1);
-                              close (rfd);
-                              if (rn > 0)
-                                break;
+                              int rfd = open (rr_path, O_RDONLY | O_NONBLOCK);
+                              if (rfd >= 0)
+                                {
+                                  rn = read (rfd, resp, sizeof (resp) - 1);
+                                  close (rfd);
+                                  if (rn > 0)
+                                    break;
+                                }
+                              usleep (1000);
                             }
-                          usleep (1000);
                         }
                       if (rn > 0 && strncmp (resp, "OK ", 3) == 0)
                         {

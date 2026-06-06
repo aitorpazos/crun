@@ -991,9 +991,12 @@ libcrun_krun_branch_listener (void *arg)
       char *child_state_dir = nl + 1;
       char *nl2 = strchr (child_state_dir, '\n');
       if (nl2) *nl2 = '\0';
-      char *state_root = nl2 ? nl2 + 1 : "";
-      char *nl3 = strchr (state_root, '\n');
+      char *response_fifo = nl2 ? nl2 + 1 : "";
+      char *nl3 = strchr (response_fifo, '\n');
       if (nl3) *nl3 = '\0';
+      char *state_root = nl3 ? nl3 + 1 : "";
+      char *nl4 = strchr (state_root, '\n');
+      if (nl4) *nl4 = '\0';
 
       trace_fd = open ("/tmp/branch_listener.trace", O_WRONLY | O_CREAT | O_APPEND, 0666);
       if (trace_fd >= 0)
@@ -1019,6 +1022,14 @@ libcrun_krun_branch_listener (void *arg)
           cleanup_free char *rr_path = NULL;
           char resp[256];
           int rn2 = snprintf (resp, sizeof (resp), "OK %d", child_ctx);
+          int sync_fd = -1;
+          if (response_fifo[0] != '\0')
+            sync_fd = open (response_fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+          if (sync_fd >= 0)
+            {
+              (void) write (sync_fd, resp, rn2);
+              close (sync_fd);
+            }
           if (asprintf (&rr_path, "/tmp/krun.branch.result.%s", child_id) > 0)
             {
               int rfd = open (rr_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -1056,6 +1067,15 @@ libcrun_krun_branch_listener (void *arg)
       else
         {
           cleanup_free char *rr_path = NULL;
+          if (response_fifo[0] != '\0')
+            {
+              int sync_fd = open (response_fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+              if (sync_fd >= 0)
+                {
+                  (void) write (sync_fd, "ERR branch", 10);
+                  close (sync_fd);
+                }
+            }
           if (asprintf (&rr_path, "/tmp/krun.branch.result.%s", child_id) > 0)
             {
               int rfd = open (rr_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);

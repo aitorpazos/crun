@@ -504,7 +504,15 @@ struct branch_listener_info
   char container_id[128];
   int use_gvproxy;
 };
+
+struct snap_listener_info
+{
+  void *handle;
+  char container_id[128];
+  uint32_t ctx_id;
+};
 static void *libcrun_krun_branch_listener (void *arg);
+static void *libcrun_krun_snap_listener (void *arg);
 
 static int
 libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname, char *const argv[])
@@ -732,19 +740,6 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
       }
   }
 
-  /* Spawn a FIFO listener in the VM process so krun_branch_ctx accesses
-     the same process-local LIVE_VMMS map.  */
-  {
-    struct branch_listener_info blinfo;
-    blinfo.handle = handle;
-    strncpy (blinfo.container_id, kconf->container_id, sizeof (blinfo.container_id) - 1);
-    blinfo.container_id[sizeof (blinfo.container_id) - 1] = '\0';
-    blinfo.use_gvproxy = kconf->use_gvproxy;
-    pthread_t bl_tid;
-    if (pthread_create (&bl_tid, NULL, libcrun_krun_branch_listener, &blinfo) == 0)
-      pthread_detach (bl_tid);
-  }
-
   /* Fork so the parent can return immediately with the VM running
      as a child process, allowing `crun create` to record a real PID.  */
   pid_t vm_pid = fork ();
@@ -771,7 +766,27 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
       _exit (WIFEXITED (wstatus) ? WEXITSTATUS (wstatus) : 1);
     }
 
-  /* vm_pid == 0: child process continues to run the VM.  */
+  /* vm_pid == 0: child process continues to run the VM.  Start FIFO
+     listeners here, in the same process that will own libkrun's LIVE_VMMS
+     map after krun_start_enter().  */
+  struct branch_listener_info blinfo;
+  blinfo.handle = handle;
+  strncpy (blinfo.container_id, kconf->container_id, sizeof (blinfo.container_id) - 1);
+  blinfo.container_id[sizeof (blinfo.container_id) - 1] = '\0';
+  blinfo.use_gvproxy = kconf->use_gvproxy;
+  pthread_t bl_tid;
+  if (pthread_create (&bl_tid, NULL, libcrun_krun_branch_listener, &blinfo) == 0)
+    pthread_detach (bl_tid);
+
+  struct snap_listener_info sinfo;
+  sinfo.handle = handle;
+  sinfo.ctx_id = (uint32_t) ctx_id;
+  strncpy (sinfo.container_id, kconf->container_id, sizeof (sinfo.container_id) - 1);
+  sinfo.container_id[sizeof (sinfo.container_id) - 1] = '\0';
+  pthread_t snap_tid;
+  if (pthread_create (&snap_tid, NULL, libcrun_krun_snap_listener, &sinfo) == 0)
+    pthread_detach (snap_tid);
+
   ret = krun_start_enter (ctx_id);
   if (UNLIKELY (ret < 0))
     error (EXIT_FAILURE, -ret, "could not start krun");
@@ -789,6 +804,87 @@ struct child_starter_args
 };
 
 static void *libcrun_krun_child_starter (void *arg);
+
+/* Snapshot listener: runs in the VM process so krun_pause_ctx/krun_snapshot_vm
+   can access libkrun's process-local LIVE_VMMS map.  The crun snap command
+   writes the desired output path to /tmp/krun.snap.<id>.fifo and polls
+   /tmp/krun.snap.<id>.result for OK/ERR. */
+static void *
+libcrun_krun_snap_listener (void *arg)
+{
+  struct snap_listener_info *info = (struct snap_listener_info *) arg;
+  void *handle = info->handle;
+  uint32_t ctx_id = info->ctx_id;
+  char container_id[128];
+  strncpy (container_id, info->container_id, sizeof (container_id) - 1);
+  container_id[sizeof (container_id) - 1] = '\0';
+
+  int32_t (*krun_pause) (uint32_t) = dlsym (handle, "krun_pause_ctx");
+  int32_t (*krun_resume) (uint32_t) = dlsym (handle, "krun_resume_ctx");
+  int32_t (*krun_snapshot) (uint32_t, int, uint32_t) = dlsym (handle, "krun_snapshot_vm");
+  if (!krun_pause || !krun_resume || !krun_snapshot)
+    return NULL;
+
+  cleanup_free char *fifo_path = NULL;
+  cleanup_free char *result_path = NULL;
+  if (asprintf (&fifo_path, "/tmp/krun.snap.%s.fifo", container_id) < 0)
+    return NULL;
+  if (asprintf (&result_path, "/tmp/krun.snap.%s.result", container_id) < 0)
+    return NULL;
+  (void) unlink (fifo_path);
+  (void) mkfifo (fifo_path, 0666);
+
+  while (1)
+    {
+      int fd = open (fifo_path, O_RDONLY);
+      if (fd < 0)
+        {
+          if (errno == EINTR)
+            continue;
+          break;
+        }
+      char path[4096] = { 0 };
+      ssize_t n = read (fd, path, sizeof (path) - 1);
+      close (fd);
+      if (n <= 0)
+        continue;
+      path[n] = '\0';
+      char *nl = strchr (path, '\n');
+      if (nl) *nl = '\0';
+      (void) unlink (result_path);
+
+      int outfd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      int32_t ret = 0;
+      if (outfd < 0)
+        {
+          int rfd = open (result_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+          if (rfd >= 0)
+            {
+              dprintf (rfd, "ERR %d open %s\n", errno, path);
+              close (rfd);
+            }
+          continue;
+        }
+      /* krun_snapshot_vm performs the necessary coordination internally for
+         this experimental live-migration path.  Calling krun_pause_ctx from a
+         helper thread can block forever once krun_start_enter owns the VMM
+         loop, so snapshot directly and let libkrun serialize state. */
+      ret = krun_snapshot (ctx_id, outfd, 0);
+      close (outfd);
+
+      int rfd = open (result_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if (rfd >= 0)
+        {
+          if (ret < 0)
+            dprintf (rfd, "ERR %d snapshot\n", -ret);
+          else
+            dprintf (rfd, "OK\n");
+          close (rfd);
+        }
+    }
+  return NULL;
+}
+
 /* Branch listener: reads branch requests from a FIFO and calls krun_branch_ctx
    in the same process owning LIVE_VMMS.  Results written to a result file.  */
 

@@ -689,7 +689,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                     {
                       char resp[128] = {0};
                       int rn = -1;
-                      for (int tries = 0; tries < 50; tries++)
+                      for (int tries = 0; tries < 5000; tries++)
                         {
                           int rfd = open (rr_path, O_RDONLY | O_NONBLOCK);
                           if (rfd >= 0)
@@ -699,7 +699,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                               if (rn > 0)
                                 break;
                             }
-                          usleep (100000);
+                          usleep (1000);
                         }
                       if (rn > 0 && strncmp (resp, "OK ", 3) == 0)
                         {
@@ -713,7 +713,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                                         (int) parent_pid, child_id);
                             if (apr > 0 && pid_path)
                               {
-                                for (int pt = 0; pt < 30; pt++)
+                                for (int pt = 0; pt < 3000; pt++)
                                   {
                                     int pfd = open (pid_path, O_RDONLY);
                                     if (pfd >= 0)
@@ -727,7 +727,7 @@ crun_command_split (struct crun_global_arguments *global_args, int argc, char **
                                             break;
                                           }
                                       }
-                                    usleep (100000);
+                                    usleep (1000);
                                   }
                               }
                           }
